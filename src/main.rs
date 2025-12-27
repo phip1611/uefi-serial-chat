@@ -1,0 +1,120 @@
+#![no_std]
+#![no_main]
+
+mod chat;
+
+extern crate alloc;
+
+use {
+    crate::chat::start_chat,
+    alloc::{
+        string::ToString,
+        vec::{
+            self,
+            Vec,
+        },
+    },
+    anyhow::anyhow,
+    core::{
+        hint,
+        panic::PanicInfo,
+        time::Duration,
+    },
+    log::{
+        error,
+        info,
+        warn,
+    },
+    uefi::{
+        CStr16,
+        Handle,
+        Identify,
+        Status,
+        boot::{
+            self,
+            LoadImageSource,
+            OpenProtocolAttributes,
+            OpenProtocolParams,
+            SearchType,
+        },
+        cstr16,
+        fs::FileSystem,
+        helpers,
+        proto::{
+            BootPolicy,
+            console::serial::Serial,
+            device_path::{
+                DevicePath,
+                build::{
+                    self,
+                    DevicePathBuilder,
+                },
+                text::{
+                    AllowShortcuts,
+                    DisplayOnly,
+                },
+            },
+            media::fs::SimpleFileSystem,
+        },
+        runtime::{
+            self,
+            ResetType,
+        },
+        system::{
+            self,
+            with_stdout,
+        },
+    },
+};
+
+#[panic_handler]
+fn handle_panic(info: &PanicInfo) -> ! {
+    error!("PANIC: {}", info);
+    loop {
+        hint::spin_loop()
+    }
+}
+
+fn find_serial_handles() -> anyhow::Result<Vec<Handle>> {
+    let mut handles = boot::find_handles::<Serial>()?;
+
+    // Retain only those who do allow to open the protocol on. UEFI is sometimes
+    // weird!
+    handles.retain(|handle| unsafe {
+        boot::open_protocol::<Serial>(
+            OpenProtocolParams {
+                handle: *handle,
+                agent: boot::image_handle(),
+                controller: None,
+            },
+            OpenProtocolAttributes::GetProtocol,
+        )
+        .is_ok()
+    });
+
+    Ok(handles)
+}
+
+fn inner_main() -> anyhow::Result<()> {
+    helpers::init()?;
+
+    info!("Hello World from uefi-serial-chat");
+    info!("UEFI revision={}, vendor={}, version={}", system::uefi_revision(), system::firmware_vendor(), system::firmware_revision());
+
+    let handles = find_serial_handles()?;
+    start_chat(&handles)?;
+
+    Ok(())
+}
+
+#[uefi::entry]
+fn main() -> Status {
+    if let Err(e) = inner_main() {
+        error!("\n{e:?}");
+    }
+
+    let seconds = 20;
+    error!("Reached end of main() function. Shutting down in {seconds}s");
+    boot::stall(Duration::from_secs(seconds));
+    runtime::reset(ResetType::SHUTDOWN, Status::SUCCESS, None);
+}
