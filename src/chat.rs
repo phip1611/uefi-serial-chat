@@ -1,3 +1,4 @@
+use alloc::vec::Vec;
 use {
     alloc::{
         format,
@@ -107,6 +108,9 @@ fn println_chat_msg(participant: ChatParticipant, msg: &str) {
 /// The console is what is handled by UEFI stdout and stdin service, which is
 /// backed by the simple text input/output protocols.
 mod console {
+    use core::fmt::Write;
+    use log::info;
+    use uefi::system::with_stdout;
     use {
         alloc::string::String,
         anyhow::anyhow,
@@ -192,13 +196,84 @@ mod console {
 
         Ok(line)
     }
+
+    /// Prompts the user for its input.
+    ///
+    /// As the user types, their typed characters will be shown to the screen.
+    pub fn prompt_input(prompt_msg: &str) -> anyhow::Result<String> {
+        if !prompt_msg.is_empty() {
+            with_stdout(|stdout| stdout.write_str(prompt_msg))?;
+        }
+
+        let event =
+            with_stdin(|input| input.wait_for_key_event()).ok_or(anyhow!("missing event"))?;
+        let wait_events = &mut [event];
+        let mut input = String::new();
+        // This variable helps us to not return characters that are part of the
+        // prompt.
+        let mut backspace_line_capacity = prompt_msg.len();
+        loop {
+            // Wait for next keystroke.
+            boot::wait_for_event(wait_events)?;
+            let key = with_stdin(|input| input.read_key())?
+                .ok_or(anyhow!("missing input when an event was signaled"))?;
+
+            match key {
+                Key::Printable(c) => {
+                    let c = char::from(c);
+                    match c {
+                        // 0-9, A-z
+                        c if c.is_ascii_alphanumeric() => {
+                            input.push(c);
+                            backspace_line_capacity += 1;
+                            // type what the user just printed
+                            with_stdout(|stdout| stdout.write_char(c))?;
+                        },
+                        c if c.is_ascii_punctuation() => {
+                            input.push(c);
+                            backspace_line_capacity += 1;
+                            // type what the user just printed
+                            with_stdout(|stdout| stdout.write_char(c))?;
+                        }
+                        '\u{8}' /* backspace */ => {
+                            if input.len() > 1 {
+                                input.remove(input.len() - 1);
+                            }
+                            if backspace_line_capacity > 0 {
+                                backspace_line_capacity -= 1;
+                                with_stdout(|stdout| stdout.write_char(c))?;
+                            }
+                        }
+                        '\r' /* enter */ => {
+                            info!("end of input line: {input}");
+                            input.push_str("\r\n");
+                            with_stdout(|stdout| stdout.write_str("\r\n"))?;
+                            break;
+                        }
+                        c => {
+                            return Err(anyhow!("Unsupported character: {c:?}"));
+                        }
+                    }
+                }
+                Key::Special(c) => {
+                    warn!("received special key code that will be ignored: {c:?}");
+                }
+            }
+        }
+
+        Ok(input)
+    }
 }
 
 /// Module for interaction with the serial device, which will act as
 /// [`ChatParticipant::Remote`].
 mod serial {
+    use alloc::format;
     use {
-        crate::chat::ChatParticipant,
+        crate::chat::{
+            ChatParticipant,
+            console,
+        },
         alloc::string::String,
         anyhow::Context,
         core::fmt::Write,
@@ -226,7 +301,6 @@ mod serial {
             },
         },
     };
-    use crate::chat::console;
 
     /// Prompts the user with the available handles and a request to select one of
     /// those.
@@ -255,9 +329,8 @@ mod serial {
             // Automatically select the first handle.
             Ok((0, handles[0]))
         } else {
-            info!("Please select a serial handle (0..{}):", handles.len() - 1);
-
-            let selection = console::read_line()?;
+            let msg = format!("Please select a serial handle (0..{}): ", handles.len() - 1);
+            let selection = console::prompt_input(&msg)?;
             // remove newline
             let selection = selection.trim();
             let selection =
@@ -310,7 +383,11 @@ mod serial {
         if read.is_empty() {
             Ok(None)
         } else {
-            let msg = String::from_utf8(read).context("reading text from serial")?;
+            let msg = String::from_utf8(read)
+                .context("reading text from serial")?
+                // Enter only sends `\r` but we also want to print that as a
+                // proper UEFI new line.
+                .replace('\r', "\r\n");
             Ok(Some(msg))
         }
     }
@@ -343,6 +420,8 @@ pub fn start_chat(handles: &[Handle]) -> anyhow::Result<()> {
     info!("  LOCAL : USB keyboard input");
     info!("  Remote: Serial input");
 
+    console::prompt_input("Ready to enter chat? Press ENTER.")?;
+
     /*println_raw("Entering chat!")?;
     serial_write(&mut serial_proto, "Entering chat!")?;
     println_raw("To exit, one side must send \"EXIT\"")?;
@@ -353,7 +432,19 @@ pub fn start_chat(handles: &[Handle]) -> anyhow::Result<()> {
     let mut current_local_line = String::new();
     let mut current_remote_line = String::new();
 
+    // all messages from old to new
+    let messages: Vec<(ChatParticipant, String)> = Vec::new();
+
+    // Redraw the game board all the time.
     loop {
+        // Clear screen
+        with_stdout(|output| output.clear())?;
+
+        // Print all messages.
+        for (participant, message) in &messages {
+
+        }
+
         let maybe_msg = serial::try_read(&mut serial_proto)?;
         if let Some(msg) = maybe_msg {
             with_stdout(|output| output.write_str(&msg))?;
@@ -366,11 +457,12 @@ pub fn start_chat(handles: &[Handle]) -> anyhow::Result<()> {
         }
 
         // Check for EXIT message
-        if [&current_local_line, &current_remote_line].iter().any(|msg| msg.contains("EXIT")) {
+        if [&current_local_line, &current_remote_line]
+            .iter()
+            .any(|msg| msg.contains("EXIT"))
+        {
             break;
         }
-
-
 
         //stall(Duration::from_millis(200));
         //println_chat_msg(ChatParticipant::Local, &current_local_line);
