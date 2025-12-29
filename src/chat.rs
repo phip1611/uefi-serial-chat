@@ -1,70 +1,29 @@
-use alloc::vec::Vec;
 use {
     alloc::{
+        collections::VecDeque,
         format,
         string::{
             String,
             ToString,
         },
+        vec::Vec,
     },
-    anyhow::{
-        Context,
-        anyhow,
-    },
+    anyhow::anyhow,
     core::{
-        fmt::{
-            self,
-            Write,
-        },
+        fmt::Write,
         time::Duration,
     },
-    log::{
-        debug,
-        info,
-        warn,
-    },
+    log::info,
     uefi::{
-        CStr16,
-        CString16,
         Handle,
-        ResultExt,
-        Status,
         boot::{
             self,
             OpenProtocolAttributes,
             OpenProtocolParams,
             stall,
         },
-        cstr16,
-        proto::{
-            console::{
-                serial::{
-                    ControlBits,
-                    Serial,
-                },
-                text::{
-                    Input,
-                    Key,
-                    OutputMode,
-                },
-            },
-            device_path::{
-                DevicePath,
-                text::{
-                    AllowShortcuts,
-                    DisplayOnly,
-                },
-            },
-        },
-        runtime::{
-            self,
-            VariableAttributes,
-            VariableVendor,
-        },
-        system::{
-            with_stdin,
-            with_stdout,
-        },
+        proto::console::serial::Serial,
+        system::with_stdout,
     },
 };
 
@@ -74,32 +33,12 @@ enum ChatParticipant {
     Remote,
 }
 
-/// Prints a raw message using the UEFI simple text output protocol.
-///
-/// The message will be terminated with a newline, if it doesn't include a
-/// newline already.
-fn println_raw(msg: &str) -> fmt::Result {
-    with_stdout(|stdout| {
-        // TODO this is wrong
-        if msg.ends_with(['\r', '\n']) {
-            stdout.write_str(msg)
-        } else if msg.ends_with('\r') || msg.ends_with('\n') {
-            stdout.write_str(&msg[0..msg.len() - 1])?;
-
-            stdout.write_str("\r\n")
-        } else {
-            stdout.write_str(msg)?;
-
-            stdout.write_str("\r\n")
-        }
-    })
-}
-
 /// Prints a chat message using the UEFI simple text output protocol.
-fn println_chat_msg(participant: ChatParticipant, msg: &str) {
+///
+/// It assumes that each messages is a single line.
+fn format_chat_message(participant: ChatParticipant, msg: &str) -> String {
     let participant = format!("{:?}", participant).to_uppercase();
-    let msg = format!("[{participant:>6}]: {msg}");
-    println_raw(&msg).unwrap();
+    format!("[{participant:>6}]: {msg}")
 }
 
 /// Module for interaction with the UEFI console, which will act as
@@ -108,39 +47,46 @@ fn println_chat_msg(participant: ChatParticipant, msg: &str) {
 /// The console is what is handled by UEFI stdout and stdin service, which is
 /// backed by the simple text input/output protocols.
 mod console {
-    use core::fmt::Write;
-    use log::info;
-    use uefi::system::with_stdout;
     use {
-        alloc::string::String,
+        alloc::{
+            string::String,
+            vec,
+            vec::Vec,
+        },
         anyhow::anyhow,
+        core::fmt::Write,
         log::{
-            debug,
+            info,
             warn,
         },
         uefi::{
-            ResultExt,
-            Status,
             boot,
-            proto::console::{
-                serial::Serial,
-                text::Key,
+            proto::console::text::Key,
+            system::{
+                with_stdin,
+                with_stdout,
             },
-            system::with_stdin,
         },
     };
 
     /// Tries to read a message from the console, if there is any input.
-    pub fn try_read() -> anyhow::Result<Option<String>> {
+    ///
+    /// The data that we read from the underlying source will be provided as
+    /// [`Char16`]. We skip some unused special key codes and only return
+    /// printable characters as well as typical ASCII control characters, such
+    /// as backspace. Newlines will be represented as `\r\n`.
+    ///
+    /// [`Char16`]: uefi::Char16
+    pub fn try_read() -> anyhow::Result<Vec<char>> {
         let event =
             with_stdin(|input| input.wait_for_key_event()).ok_or(anyhow!("missing event"))?;
         if !boot::check_event(event)? {
-            return Ok(None);
+            return Ok(vec![]);
         }
 
-        let mut msg = String::new();
+        let mut data = Vec::new();
 
-        // Read keystrokes until all are consumed and collect them all in `msg`.
+        // Read all available keystrokes and collect them in the vec.
         loop {
             let res = with_stdin(|input| input.read_key())?;
             let key = match res {
@@ -152,49 +98,14 @@ mod console {
             };
 
             match key {
-                Key::Printable(c) => msg.push(char::from(c)),
+                Key::Printable(c) => data.push(char::from(c)),
                 Key::Special(c) => {
-                    log::warn!("Ignoring special key: {c:?}");
+                    warn!("Ignoring special key: {c:?}");
                 }
             }
         }
 
-        Ok(Some(msg))
-    }
-
-    /// Blocking call that reads a message from the consol that returns after
-    /// the first newline (pressed enter key) was found.
-    ///
-    /// The returned string does contain the newline.
-    pub fn read_line() -> anyhow::Result<String> {
-        let mut line = String::new();
-
-        let event =
-            with_stdin(|input| input.wait_for_key_event()).ok_or(anyhow!("missing event"))?;
-        let wait_events = &mut [event];
-        loop {
-            // Wait for next keystroke.
-            boot::wait_for_event(wait_events)?;
-            let key = with_stdin(|input| input.read_key())?
-                .ok_or(anyhow!("missing input when an event was signaled"))?;
-            match key {
-                Key::Printable(c) => {
-                    let c = char::from(c);
-                    line.push(c);
-                    // enter
-                    if char::from(c) == '\r' {
-                        // properly terminate the newline
-                        line.push('\n');
-                        break;
-                    }
-                }
-                Key::Special(c) => {
-                    warn!("received special key code that will be ignored: {c:?}");
-                }
-            }
-        }
-
-        Ok(line)
+        Ok(data)
     }
 
     /// Prompts the user for its input.
@@ -209,9 +120,6 @@ mod console {
             with_stdin(|input| input.wait_for_key_event()).ok_or(anyhow!("missing event"))?;
         let wait_events = &mut [event];
         let mut input = String::new();
-        // This variable helps us to not return characters that are part of the
-        // prompt.
-        let mut backspace_line_capacity = prompt_msg.len();
         loop {
             // Wait for next keystroke.
             boot::wait_for_event(wait_events)?;
@@ -222,25 +130,11 @@ mod console {
                 Key::Printable(c) => {
                     let c = char::from(c);
                     match c {
-                        // 0-9, A-z
-                        c if c.is_ascii_alphanumeric() => {
-                            input.push(c);
-                            backspace_line_capacity += 1;
-                            // type what the user just printed
-                            with_stdout(|stdout| stdout.write_char(c))?;
-                        },
-                        c if c.is_ascii_punctuation() => {
-                            input.push(c);
-                            backspace_line_capacity += 1;
-                            // type what the user just printed
-                            with_stdout(|stdout| stdout.write_char(c))?;
-                        }
                         '\u{8}' /* backspace */ => {
                             if input.len() > 1 {
                                 input.remove(input.len() - 1);
-                            }
-                            if backspace_line_capacity > 0 {
-                                backspace_line_capacity -= 1;
+                                // UEFI console handles a backspace properly on
+                                // screen already by default.
                                 with_stdout(|stdout| stdout.write_char(c))?;
                             }
                         }
@@ -249,6 +143,17 @@ mod console {
                             input.push_str("\r\n");
                             with_stdout(|stdout| stdout.write_str("\r\n"))?;
                             break;
+                        }
+                        // 0-9, A-Z, a-z
+                        c if c.is_ascii_alphanumeric() => {
+                            input.push(c);
+                            // type what the user just printed
+                            with_stdout(|stdout| stdout.write_char(c))?;
+                        }
+                        c if c.is_ascii_punctuation() => {
+                            input.push(c);
+                            // type what the user just printed
+                            with_stdout(|stdout| stdout.write_char(c))?;
                         }
                         c => {
                             return Err(anyhow!("Unsupported character: {c:?}"));
@@ -260,30 +165,56 @@ mod console {
                 }
             }
         }
-
         Ok(input)
+    }
+
+    /// Extracts all complete UTF-8–encoded lines from the buffer and returns
+    /// them as a single `String`.
+    ///
+    /// The returned string does **not** include the final newline character.
+    /// All bytes corresponding to the returned lines are removed from `data`.
+    /// All `\r\n` sequences will be replaced by `\n`.
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(Some(String))` if at least one complete line was extracted.
+    /// - `Ok(None)` if no complete line is present in the buffer.
+    /// - `Err(_)` if UTF-8 validation or conversion fails.
+    pub fn remove_lines_to_string(data: &mut Vec<char>) -> anyhow::Result<Option<String>> {
+        // We search for the last newline.
+        let pos = data.iter().rposition(|char| *char == '\r');
+        if pos.is_none() {
+            return Ok(None);
+        }
+        let pos = pos.unwrap();
+        let lines = &data[0..pos];
+        let lines = lines.iter().collect::<String>();
+        let lines = lines.replace("\r\n", "\n");
+
+        // remove everything including the newline
+        for _ in 0..=pos {
+            data.remove(0);
+        }
+
+        Ok(Some(lines))
     }
 }
 
 /// Module for interaction with the serial device, which will act as
 /// [`ChatParticipant::Remote`].
 mod serial {
-    use alloc::format;
     use {
-        crate::chat::{
-            ChatParticipant,
-            console,
+        crate::chat::console,
+        alloc::{
+            format,
+            string::String,
+            vec::Vec,
         },
-        alloc::string::String,
         anyhow::Context,
         core::fmt::Write,
-        log::{
-            debug,
-            info,
-        },
+        log::info,
         uefi::{
             Handle,
-            Status,
             boot::{
                 self,
                 OpenProtocolAttributes,
@@ -376,20 +307,44 @@ mod serial {
         serial.write_str(msg).map_err(|e| e.into())
     }
 
-    /// Tries to read a message from the serial device, if it received any from
-    /// the remote so far.
-    pub fn try_read(serial: &mut Serial) -> anyhow::Result<Option<String>> {
-        let read = serial.read_to_end()?;
-        if read.is_empty() {
-            Ok(None)
-        } else {
-            let msg = String::from_utf8(read)
-                .context("reading text from serial")?
-                // Enter only sends `\r` but we also want to print that as a
-                // proper UEFI new line.
-                .replace('\r', "\r\n");
-            Ok(Some(msg))
+    /// Tries to read the latest raw data from the serial device, if it received
+    /// any from the remote so far.
+    ///
+    /// The data is raw and unprocessed, but likely to be valid UTF-8 with
+    /// some control characters.
+    pub fn try_read(serial: &mut Serial) -> anyhow::Result<Vec<u8>> {
+        serial.read_to_end().map_err(|e| e.into())
+    }
+
+    /// Extracts all complete UTF-8–encoded lines from the buffer and returns them
+    /// as a single `String`.
+    ///
+    /// The returned string does **not** include the final newline character.
+    /// All bytes corresponding to the returned lines are removed from `data`.
+    ///
+    /// # Returns
+    ///
+    /// - `Ok(Some(String))` if at least one complete line was extracted.
+    /// - `Ok(None)` if no complete line is present in the buffer.
+    /// - `Err(_)` if UTF-8 validation or conversion fails.
+    pub fn remove_lines_to_string(data: &mut Vec<u8>) -> anyhow::Result<Option<String>> {
+        // We search for the last newline.
+        // In a serial terminal by convention, the terminal will send a `\r` for
+        // a newline.
+        let pos = data.iter().rposition(|char| *char == b'\r');
+        if pos.is_none() {
+            return Ok(None);
         }
+        let pos = pos.unwrap();
+        let lines = &data[0..pos];
+        let lines = String::from_utf8(lines.to_vec())?;
+
+        // remove everything including the newline
+        for _ in 0..=pos {
+            data.remove(0);
+        }
+
+        Ok(Some(lines))
     }
 }
 
@@ -418,9 +373,9 @@ pub fn start_chat(handles: &[Handle]) -> anyhow::Result<()> {
     serial::setup(serial_proto.open_params().handle, &mut serial_proto)?;
     info!("Successfully set up input and serial device!");
     info!("  LOCAL : USB keyboard input");
-    info!("  Remote: Serial input");
+    info!("  REMOTE: Serial input");
 
-    console::prompt_input("Ready to enter chat? Press ENTER.")?;
+    // TODO enable again console::prompt_input("Ready to enter chat? Press ENTER.")?;
 
     /*println_raw("Entering chat!")?;
     serial_write(&mut serial_proto, "Entering chat!")?;
@@ -429,44 +384,81 @@ pub fn start_chat(handles: &[Handle]) -> anyhow::Result<()> {
 
     // We read from the remote (the serial device) and the user all the time.
 
-    let mut current_local_line = String::new();
-    let mut current_remote_line = String::new();
+    // Current raw processed input including control characters.
+    let mut current_local_raw_input = Vec::new();
+    let mut current_remote_raw_input = Vec::new();
 
-    // all messages from old to new
-    let messages: Vec<(ChatParticipant, String)> = Vec::new();
+    // all parsed messages from old to new
+    let mut messages = VecDeque::<(ChatParticipant, String)>::new();
 
-    // Redraw the game board all the time.
+    // Refetch the latest data and redraw the game board + prompts all the time.
     loop {
-        // Clear screen
-        with_stdout(|output| output.clear())?;
+        // query latest data from data sources
+        current_local_raw_input.extend(console::try_read()?);
+        current_remote_raw_input.extend(serial::try_read(&mut serial_proto)?);
 
-        // Print all messages.
+        // Process raw input, extract lines, and put that into `messages`
+        {
+            let lines = console::remove_lines_to_string(&mut current_local_raw_input)?;
+            if let Some(lines) = lines {
+                for line in lines.lines() {
+                    messages.push_back((ChatParticipant::Local, line.to_string()));
+                }
+            }
+            let lines = serial::remove_lines_to_string(&mut current_remote_raw_input)?;
+            if let Some(lines) = lines {
+                for line in lines.lines() {
+                    messages.push_back((ChatParticipant::Remote, line.to_string()));
+                }
+            }
+        }
+
+        // remove messages in case we have too many on the screen
+        while messages.len() > 20 {
+            messages.pop_front();
+        }
+
+        // Clear screens
+        {
+            // local
+            {
+                with_stdout(|output| output.clear())?;
+            }
+            // for remote
+            {
+                // Assuming the workload uses a VT100-compatible terminal emulator.
+                // clear screen, clear line, cursor to pos 1:1
+                serial::write(&mut serial_proto, &"\x1B[2J\x1B[H")?;
+            }
+        }
+
+        // Print all messages as single lines.
         for (participant, message) in &messages {
-
+            let message = format_chat_message(*participant, message);
+            with_stdout(|stdout| stdout.write_str(&message))?;
+            with_stdout(|stdout| stdout.write_str("\r\n"))?;
+            serial::write(&mut serial_proto, &message)?;
+            serial::write(&mut serial_proto, "\n")?;
         }
 
-        let maybe_msg = serial::try_read(&mut serial_proto)?;
-        if let Some(msg) = maybe_msg {
-            with_stdout(|output| output.write_str(&msg))?;
-            current_remote_line.push_str(&msg);
-        }
-        let maybe_msg = console::try_read()?;
-        if let Some(msg) = maybe_msg {
-            with_stdout(|output| output.write_str(&msg))?;
-            current_local_line.push_str(&msg);
+        // print each user what they are currently typing
+        {
+            let input = current_local_raw_input.iter().collect::<String>();
+            with_stdout(|stdout| stdout.write_str(&input))?;
+
+            let input = String::from_utf8_lossy(&current_remote_raw_input);
+            serial::write(&mut serial_proto, &input)?;
         }
 
-        // Check for EXIT message
+        /*// Check for EXIT message
         if [&current_local_line, &current_remote_line]
             .iter()
             .any(|msg| msg.contains("EXIT"))
         {
             break;
-        }
+        }*/
 
-        //stall(Duration::from_millis(200));
-        //println_chat_msg(ChatParticipant::Local, &current_local_line);
-        //println_chat_msg(ChatParticipant::Remote, &current_remote_line);
+        stall(Duration::from_millis(100));
     }
 
     Ok(())

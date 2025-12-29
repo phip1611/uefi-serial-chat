@@ -7,14 +7,7 @@ extern crate alloc;
 
 use {
     crate::chat::start_chat,
-    alloc::{
-        string::ToString,
-        vec::{
-            self,
-            Vec,
-        },
-    },
-    anyhow::anyhow,
+    alloc::vec::Vec,
     core::{
         hint,
         panic::PanicInfo,
@@ -23,47 +16,22 @@ use {
     log::{
         error,
         info,
-        warn,
     },
     uefi::{
-        CStr16,
         Handle,
-        Identify,
         Status,
         boot::{
             self,
-            LoadImageSource,
             OpenProtocolAttributes,
             OpenProtocolParams,
-            SearchType,
         },
-        cstr16,
-        fs::FileSystem,
         helpers,
-        proto::{
-            BootPolicy,
-            console::serial::Serial,
-            device_path::{
-                DevicePath,
-                build::{
-                    self,
-                    DevicePathBuilder,
-                },
-                text::{
-                    AllowShortcuts,
-                    DisplayOnly,
-                },
-            },
-            media::fs::SimpleFileSystem,
-        },
+        proto::console::serial::Serial,
         runtime::{
             self,
             ResetType,
         },
-        system::{
-            self,
-            with_stdout,
-        },
+        system,
     },
 };
 
@@ -99,7 +67,12 @@ fn inner_main() -> anyhow::Result<()> {
     helpers::init()?;
 
     info!("Hello World from uefi-serial-chat");
-    info!("UEFI revision={}, vendor={}, version={}", system::uefi_revision(), system::firmware_vendor(), system::firmware_revision());
+    info!(
+        "UEFI revision={}, vendor={}, version={}",
+        system::uefi_revision(),
+        system::firmware_vendor(),
+        system::firmware_revision()
+    );
 
     let handles = find_serial_handles()?;
     start_chat(&handles)?;
