@@ -50,7 +50,6 @@ mod console {
     use {
         alloc::{
             string::String,
-            vec,
             vec::Vec,
         },
         anyhow::anyhow,
@@ -81,7 +80,7 @@ mod console {
         let event =
             with_stdin(|input| input.wait_for_key_event()).ok_or(anyhow!("missing event"))?;
         if !boot::check_event(event)? {
-            return Ok(vec![]);
+            return Ok(Vec::new());
         }
 
         let mut data = Vec::new();
@@ -169,7 +168,8 @@ mod console {
     }
 
     /// Extracts all complete UTF-8–encoded lines from the buffer and returns
-    /// them as a single `String`.
+    /// them as a single `String`, possibly including control characters
+    /// such as backspace (`0x8`.
     ///
     /// The returned string does **not** include the final newline character.
     /// All bytes corresponding to the returned lines are removed from `data`.
@@ -307,6 +307,35 @@ mod serial {
         serial.write_str(msg).map_err(|e| e.into())
     }
 
+    /// Normalizes the input coming from the serial device, which is most likely
+    /// coming from a VT100-compatible terminal emulator.
+    pub fn normalize_vt100_input(data: &mut [u8]) {
+        // normalize backspace
+        data.iter_mut()
+            .filter(|char| **char == '\u{7f}' as u8)
+            .for_each(|char| {
+                *char = '\u{8}' as u8;
+            });
+    }
+
+    /// Normalizes the output we want to print.
+    ///
+    /// - make sure a backspace also removes the character and not just
+    ///   clears the space
+    pub fn normalize_vt100_output(data: &mut String) {
+        let mut char_i = data.chars().count();
+        while char_i > 0 {
+            // Get the previous char boundary
+            let (byte_i, ch) = data.char_indices().nth(char_i - 1).unwrap();
+            if ch == '\u{8}' {
+                // Insert a space and then the backspace at the current position
+                data.insert(byte_i, ' ');
+                data.insert(byte_i, '\u{8}');
+            }
+            char_i = char_i - 1;
+        }
+    }
+
     /// Tries to read the latest raw data from the serial device, if it received
     /// any from the remote so far.
     ///
@@ -317,7 +346,8 @@ mod serial {
     }
 
     /// Extracts all complete UTF-8–encoded lines from the buffer and returns them
-    /// as a single `String`.
+    /// as a single normalized `String`, possibly including control characters
+    /// such as backspace (`0x8`).
     ///
     /// The returned string does **not** include the final newline character.
     /// All bytes corresponding to the returned lines are removed from `data`.
@@ -375,38 +405,39 @@ pub fn start_chat(handles: &[Handle]) -> anyhow::Result<()> {
     info!("  LOCAL : USB keyboard input");
     info!("  REMOTE: Serial input");
 
-    // TODO enable again console::prompt_input("Ready to enter chat? Press ENTER.")?;
-
-    /*println_raw("Entering chat!")?;
-    serial_write(&mut serial_proto, "Entering chat!")?;
-    println_raw("To exit, one side must send \"EXIT\"")?;
-    serial_write(&mut serial_proto, "To exit, one side must send \"EXIT\"")?;*/
-
-    // We read from the remote (the serial device) and the user all the time.
+    console::prompt_input("Ready to enter chat? Press ENTER.")?;
 
     // Current raw processed input including control characters.
-    let mut current_local_raw_input = Vec::new();
-    let mut current_remote_raw_input = Vec::new();
+    let mut current_local_raw_input_all = Vec::new();
+    let mut current_remote_raw_input_all = Vec::new();
+    let mut current_local_raw_input_new;
+    let mut current_remote_raw_input_new;
 
     // all parsed messages from old to new
     let mut messages = VecDeque::<(ChatParticipant, String)>::new();
 
+    let mut need_refresh = true;
     // Refetch the latest data and redraw the game board + prompts all the time.
     loop {
         // query latest data from data sources
-        current_local_raw_input.extend(console::try_read()?);
-        current_remote_raw_input.extend(serial::try_read(&mut serial_proto)?);
+        current_local_raw_input_new = console::try_read()?;
+        current_remote_raw_input_new = serial::try_read(&mut serial_proto)?;
+        serial::normalize_vt100_input(&mut current_remote_raw_input_new);
+        current_local_raw_input_all.extend(&current_local_raw_input_new);
+        current_remote_raw_input_all.extend(&current_remote_raw_input_new);
 
         // Process raw input, extract lines, and put that into `messages`
         {
-            let lines = console::remove_lines_to_string(&mut current_local_raw_input)?;
+            let lines = console::remove_lines_to_string(&mut current_local_raw_input_all)?;
             if let Some(lines) = lines {
+                need_refresh = true;
                 for line in lines.lines() {
                     messages.push_back((ChatParticipant::Local, line.to_string()));
                 }
             }
-            let lines = serial::remove_lines_to_string(&mut current_remote_raw_input)?;
+            let lines = serial::remove_lines_to_string(&mut current_remote_raw_input_all)?;
             if let Some(lines) = lines {
+                need_refresh = true;
                 for line in lines.lines() {
                     messages.push_back((ChatParticipant::Remote, line.to_string()));
                 }
@@ -414,51 +445,60 @@ pub fn start_chat(handles: &[Handle]) -> anyhow::Result<()> {
         }
 
         // remove messages in case we have too many on the screen
-        while messages.len() > 20 {
-            messages.pop_front();
+        if need_refresh
+        /* just added a new message */
+        {
+            while messages.len() > 20 {
+                messages.pop_front();
+            }
         }
 
-        // Clear screens
-        {
-            // local
+        if need_refresh {
+            // Clear screens
             {
+                // local
                 with_stdout(|output| output.clear())?;
-            }
-            // for remote
-            {
-                // Assuming the workload uses a VT100-compatible terminal emulator.
-                // clear screen, clear line, cursor to pos 1:1
+                // for remote:
+                // Assuming the workload uses a VT100-compatible terminal
+                // emulator: clear screen, clear line, cursor to pos 1:1
                 serial::write(&mut serial_proto, &"\x1B[2J\x1B[H")?;
             }
-        }
 
-        // Print all messages as single lines.
-        for (participant, message) in &messages {
-            let message = format_chat_message(*participant, message);
-            with_stdout(|stdout| stdout.write_str(&message))?;
-            with_stdout(|stdout| stdout.write_str("\r\n"))?;
-            serial::write(&mut serial_proto, &message)?;
-            serial::write(&mut serial_proto, "\n")?;
+            // Print all messages as single lines.
+            for (participant, message) in &messages {
+                let mut message = format_chat_message(*participant, message);
+                with_stdout(|stdout| stdout.write_str(&message))?;
+                with_stdout(|stdout| stdout.write_str("\r\n"))?;
+                serial::normalize_vt100_output(&mut message);
+                serial::write(&mut serial_proto, &message)?;
+                serial::write(&mut serial_proto, "\r\n")?;
+            }
         }
 
         // print each user what they are currently typing
         {
-            let input = current_local_raw_input.iter().collect::<String>();
+            let input = if need_refresh {
+                current_local_raw_input_all.iter().collect::<String>()
+            } else {
+                current_local_raw_input_new.iter().collect::<String>()
+            };
             with_stdout(|stdout| stdout.write_str(&input))?;
 
-            let input = String::from_utf8_lossy(&current_remote_raw_input);
+            let input = if need_refresh {
+                String::from_utf8_lossy(&current_remote_raw_input_all)
+            } else {
+                String::from_utf8_lossy(&current_remote_raw_input_new)
+            };
+            let mut input = input.to_string();
+            serial::normalize_vt100_output(&mut input);
             serial::write(&mut serial_proto, &input)?;
         }
 
-        /*// Check for EXIT message
-        if [&current_local_line, &current_remote_line]
-            .iter()
-            .any(|msg| msg.contains("EXIT"))
-        {
-            break;
-        }*/
+        if need_refresh {
+            need_refresh = false;
+        }
 
-        stall(Duration::from_millis(100));
+        stall(Duration::from_millis(50));
     }
 
     Ok(())
