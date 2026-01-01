@@ -138,7 +138,6 @@ mod console {
                             }
                         }
                         '\r' /* enter */ => {
-                            info!("end of input line: {input}");
                             input.push_str("\r\n");
                             with_stdout(|stdout| stdout.write_str("\r\n"))?;
                             break;
@@ -292,7 +291,7 @@ mod serial {
                 // At least in OVMF, setting this to 0, will cause an override
                 // with the default. Therefore, we put a minimum value here for
                 // low latency.
-                mode.timeout_us = 1 /* us*/;
+                mode.timeout = 1 /* us*/;
                 mode
             };
             serial.set_attributes(&mode)?;

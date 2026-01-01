@@ -2,9 +2,13 @@
 #![no_main]
 
 mod chat;
+mod serial_impl;
 
 extern crate alloc;
 
+use alloc::vec;
+use anyhow::{anyhow, Context};
+use uefi::ResultExt;
 use {
     crate::chat::start_chat,
     alloc::vec::Vec,
@@ -44,7 +48,15 @@ fn handle_panic(info: &PanicInfo) -> ! {
 }
 
 fn find_serial_handles() -> anyhow::Result<Vec<Handle>> {
-    let mut handles = boot::find_handles::<Serial>()?;
+    let mut handles = {
+        let result =  boot::find_handles::<Serial>();
+        let status = result.status();
+        match (result, status) {
+            (Ok(handles), _) => handles,
+            (Err(_), Status::NOT_FOUND) => vec![],
+            (err @ Err(_), _) => return err.context("finding serial device handles"),
+        }
+    };
 
     // Retain only those who do allow to open the protocol on. UEFI is sometimes
     // weird!
@@ -74,6 +86,7 @@ fn inner_main() -> anyhow::Result<()> {
         system::firmware_revision()
     );
 
+    serial_impl::install()?;
     let handles = find_serial_handles()?;
     start_chat(&handles)?;
 
