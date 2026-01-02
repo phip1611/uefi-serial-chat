@@ -202,6 +202,7 @@ mod console {
 /// Module for interaction with the serial device, which will act as
 /// [`ChatParticipant::Remote`].
 mod serial {
+    use log::debug;
     use {
         crate::chat::console,
         alloc::{
@@ -271,19 +272,8 @@ mod serial {
     }
 
     /// Sets up the input handling and the serial device.
-    ///
-    /// - set timeout to a minimal value to enable non-blocking reads
-    /// - disconnect any users, such as UEFIs console service (via the simple
-    ///   text input protocol)
-    pub fn setup(serial_handle: Handle, serial: &mut Serial) -> anyhow::Result<()> {
+    pub fn setup(serial: &mut Serial) -> anyhow::Result<()> {
         info!("Setting up serial device:");
-
-        // Disconnect UEFIs console service (simple text input protocol) from the
-        // serial device. Otherwise, we can't have distinct reads from the serial
-        // device and the simple text input protocol (which still supports USB
-        // keyboard strokes).
-        boot::disconnect_controller(serial_handle, None /* disconnect all drivers */, None)?;
-
         // Prepare serial mode.
         {
             let mode = {
@@ -295,7 +285,7 @@ mod serial {
                 mode
             };
             serial.set_attributes(&mode)?;
-            info!("  io_mode: {:#?}", serial.io_mode());
+            debug!("  io_mode: {:#?}", serial.io_mode());
         }
 
         Ok(())
@@ -388,6 +378,13 @@ pub fn start_chat(handles: &[Handle]) -> anyhow::Result<()> {
     let (serial_handle_i, serial_handle) = serial::select_handle(handles)?;
     info!("Chosen handle {serial_handle_i}");
 
+    // Disconnect any serial handle from the console device.
+    // At this point, no more normal logging output will be send to the serial
+    // device.
+    for handle in handles {
+        boot::disconnect_controller(*handle, None, None)?;
+    }
+
     let mut serial_proto = unsafe {
         boot::open_protocol::<Serial>(
             OpenProtocolParams {
@@ -399,7 +396,7 @@ pub fn start_chat(handles: &[Handle]) -> anyhow::Result<()> {
         )?
     };
 
-    serial::setup(serial_proto.open_params().handle, &mut serial_proto)?;
+    serial::setup(&mut serial_proto)?;
     info!("Successfully set up input and serial device!");
     info!("  LOCAL : USB keyboard input");
     info!("  REMOTE: Serial input");

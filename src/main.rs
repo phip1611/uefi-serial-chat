@@ -8,6 +8,7 @@ extern crate alloc;
 
 use alloc::vec;
 use anyhow::{anyhow, Context};
+use uefi::proto::driver::ComponentName2;
 use uefi::ResultExt;
 use {
     crate::chat::start_chat,
@@ -85,7 +86,7 @@ fn inner_main() -> anyhow::Result<()> {
         system::firmware_vendor(),
         system::firmware_revision()
     );
-
+    
     serial_impl::install()?;
     let handles = find_serial_handles()?;
     start_chat(&handles)?;
