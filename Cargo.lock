@@ -86,12 +86,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rustversion"
-version = "1.0.22"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
-
-[[package]]
 name = "spin"
 version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -109,13 +103,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "uart_16550"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "94d293f51425981fdb1b766beae254dbb711a17e8c4b549dc69b9b7ee0d478d5"
+name = "uart_16550_port"
+version = "0.1.0"
 dependencies = [
  "bitflags 2.10.0",
- "rustversion",
  "x86",
 ]
 
@@ -166,9 +157,10 @@ name = "uefi-serial-chat"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bitflags 2.10.0",
  "log",
  "spin",
- "uart_16550",
+ "uart_16550_port",
  "uefi",
  "uefi-raw",
 ]

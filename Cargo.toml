@@ -10,11 +10,12 @@ publish = false
 
 [dependencies]
 anyhow = { version = "1.0", default-features = false, features = [] }
+bitflags = { version = "2.10", default-features = false, features = [] }
 log = { version = "0.4", default-features = false, features = [] }
 spin = { version = "0.10", default-features = false, features = ["once"] }
-uart_16550 = { version = "0.4", default-features = false, features = [] }
+uart_16550_port = { path = "../uart_16550_port" }
 uefi = { version = "0.36", default-features = false, features = ["alloc", "log-debugcon", "global_allocator", "logger"] }
-uefi-raw = { version = "0.13.0" }
+uefi-raw = { version = "0.13" }
 
 [patch.crates-io]
 uefi = { path = "../uefi-rs/uefi" }

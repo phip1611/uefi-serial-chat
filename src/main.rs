@@ -13,8 +13,7 @@ use {
         vec::Vec,
     },
     anyhow::{
-        Context,
-        anyhow,
+        Context
     },
     core::{
         hint,
@@ -36,8 +35,7 @@ use {
         },
         helpers,
         proto::{
-            console::serial::Serial,
-            driver::ComponentName2,
+            console::serial::Serial
         },
         runtime::{
             self,

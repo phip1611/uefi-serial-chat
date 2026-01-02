@@ -55,7 +55,6 @@ mod console {
         anyhow::anyhow,
         core::fmt::Write,
         log::{
-            info,
             warn,
         },
         uefi::{
@@ -380,13 +379,6 @@ pub fn start_chat(handles: &[Handle]) -> anyhow::Result<()> {
     let (serial_handle_i, serial_handle) = serial::select_handle(handles)?;
     info!("Chosen handle {serial_handle_i}");
 
-    // Disconnect any serial handle from the console device.
-    // At this point, no more normal logging output will be send to the serial
-    // device.
-    for handle in handles {
-        boot::disconnect_controller(*handle, None, None)?;
-    }
-
     let mut serial_proto = unsafe {
         boot::open_protocol::<Serial>(
             OpenProtocolParams {
@@ -405,6 +397,13 @@ pub fn start_chat(handles: &[Handle]) -> anyhow::Result<()> {
 
     console::prompt_input("Ready to enter chat? Press ENTER.")?;
 
+    // Disconnect any serial handle from the console device.
+    // At this point, no more normal logging output will be sent to the serial
+    // device.
+    for handle in handles {
+        boot::disconnect_controller(*handle, None, None)?;
+    }
+
     // Current raw processed input including control characters.
     let mut current_local_raw_input_all = Vec::new();
     let mut current_remote_raw_input_all = Vec::new();
@@ -420,11 +419,11 @@ pub fn start_chat(handles: &[Handle]) -> anyhow::Result<()> {
         // query latest data from data sources
         current_local_raw_input_new = console::try_read()?;
         current_remote_raw_input_new = serial::try_read(&mut serial_proto)?;
-        info!("serial data before normalization: {current_remote_raw_input_new:x?}");
-        info!("                                : {:x?}", str::from_utf8(&current_remote_raw_input_new));
+        //info!("serial data before normalization: {current_remote_raw_input_new:x?}");
+        //info!("                                : {:x?}", str::from_utf8(&current_remote_raw_input_new));
         serial::normalize_vt100_input(&mut current_remote_raw_input_new);
-        info!("serial data after normalization : {current_remote_raw_input_new:x?}");
-        info!("                                : {:x?}", str::from_utf8(&current_remote_raw_input_new));
+        //info!("serial data after normalization : {current_remote_raw_input_new:x?}");
+        //info!("                                : {:x?}", str::from_utf8(&current_remote_raw_input_new));
         current_local_raw_input_all.extend(&current_local_raw_input_new);
         current_remote_raw_input_all.extend(&current_remote_raw_input_new);
 
@@ -500,7 +499,7 @@ pub fn start_chat(handles: &[Handle]) -> anyhow::Result<()> {
             need_refresh = false;
         }
 
-        stall(Duration::from_millis(1500));
+        stall(Duration::from_millis(50));
     }
 
     Ok(())

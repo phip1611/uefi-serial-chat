@@ -18,7 +18,6 @@ cp "$EFI_FILE" "$BOOT_VOL/EFI/BOOT/BOOTX64.EFI"
 # We pretend we have systemd-boot here to test the chain loading
 cp "$EFI_FILE" "$BOOT_VOL/EFI/systemd/systemd-bootx64.efi"
 
-#    -chardev serial,id=hostserial,path=/dev/ttyS0 \
 qemu-system-x86_64 \
     -bios $OVMF \
     -chardev pty,id=charserial0 \
