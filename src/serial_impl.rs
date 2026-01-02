@@ -4,7 +4,7 @@
 #![allow(static_mut_refs)]
 
 use anyhow::Context;
-use uart_16550_port::{BaudRate, DataBits, SerialConfig, StopBits, Uart16550Port};
+use serial_16550::{BaudRate, DataBits, SerialConfig, StopBits, Uart16550Port};
 use {
     alloc::{
         boxed::Box,
