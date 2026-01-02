@@ -1,20 +1,52 @@
 //! Implementation for the UEFI serial protocol.
 
-use alloc::boxed::Box;
-use alloc::vec::Vec;
-use core::fmt::Write;
-use core::pin::Pin;
-use core::ptr::null;
-use core::slice;
-use log::debug;
-use spin::Spin;
-use uart_16550::{SerialPort, WouldBlockError};
-use uefi::{boot, Handle, Identify};
-use uefi::proto::console::serial::{IoMode, Serial};
-use uefi::proto::device_path::{build, messaging, DevicePath};
-use uefi::proto::device_path::build::DevicePathBuilder;
-use uefi_raw::protocol::console::serial::{ControlBits, Parity, SerialIoMode, SerialIoProtocol, StopBits};
-use uefi_raw::Status;
+use {
+    alloc::{
+        boxed::Box,
+        vec::Vec,
+    },
+    core::{
+        fmt::Write,
+        pin::Pin,
+        ptr::null,
+        slice,
+    },
+    log::debug,
+    spin::Spin,
+    uart_16550::{
+        SerialPort,
+        WouldBlockError,
+    },
+    uefi::{
+        Handle,
+        Identify,
+        boot,
+        proto::{
+            console::serial::{
+                IoMode,
+                Serial,
+            },
+            device_path::{
+                DevicePath,
+                build::{
+                    self,
+                    DevicePathBuilder,
+                },
+                messaging,
+            },
+        },
+    },
+    uefi_raw::{
+        Status,
+        protocol::console::serial::{
+            ControlBits,
+            Parity,
+            SerialIoMode,
+            SerialIoProtocol,
+            StopBits,
+        },
+    },
+};
 
 static INTERFACE: spin::Once<CustomSerialIoProtocol> = spin::Once::new();
 
@@ -35,16 +67,20 @@ impl CustomSerialIoProtocol {
             panic!("already initialized");
         }
 
+        log::debug!("WAH");
         self.device.init();
+        log::debug!("WAH");
 
         self.initialized = true;
     }
 
     fn update_io_mode(&mut self, new_io_mode: IoMode) {
         self.mode = new_io_mode;
+        log::debug!("WAH");
         let ptr = &raw const self.mode;
         // SAFETY: We take care of that `self.mode` will not be invalidated.
         self.inner.mode = ptr;
+        log::debug!("WAH");
     }
 }
 
@@ -56,23 +92,21 @@ unsafe impl Sync for CustomSerialIoProtocol {}
 unsafe extern "efiapi" fn serial_protocol_reset(this: *mut SerialIoProtocol) -> Status {
     debug!("hello");
     // SAFETY: We installed the protocol interface before and know the ABI.
-    let this = unsafe {
-        this.cast::<CustomSerialIoProtocol>().as_mut().unwrap()
-    };
+    let this = unsafe { this.cast::<CustomSerialIoProtocol>().as_mut().unwrap() };
     Status::UNSUPPORTED
-
 }
 
-unsafe extern "efiapi" fn serial_protocol_set_attributes(this: *mut SerialIoProtocol, baud_rate: u64,
-                                                         receive_fifo_depth: u32,
-                                                         timeout: u32,
-                                                         parity: Parity,
-                                                         data_bits: u8,
-                                                         stop_bits_type: StopBits,) -> Status {
+unsafe extern "efiapi" fn serial_protocol_set_attributes(
+    this: *mut SerialIoProtocol,
+    baud_rate: u64,
+    receive_fifo_depth: u32,
+    timeout: u32,
+    parity: Parity,
+    data_bits: u8,
+    stop_bits_type: StopBits,
+) -> Status {
     // SAFETY: We installed the protocol interface before and know the ABI.
-    let this = unsafe {
-        this.cast::<CustomSerialIoProtocol>().as_mut().unwrap()
-    };
+    let this = unsafe { this.cast::<CustomSerialIoProtocol>().as_mut().unwrap() };
     if !this.initialized {
         this.init();
     }
@@ -87,53 +121,62 @@ unsafe extern "efiapi" fn serial_protocol_set_attributes(this: *mut SerialIoProt
     };
     this.update_io_mode(attributes);
     Status::SUCCESS
-
 }
 
-unsafe extern "efiapi" fn serial_protocol_set_control_bits(this: *mut SerialIoProtocol, bits: ControlBits) -> Status {
+unsafe extern "efiapi" fn serial_protocol_set_control_bits(
+    this: *mut SerialIoProtocol,
+    bits: ControlBits,
+) -> Status {
     // SAFETY: We installed the protocol interface before and know the ABI.
-    let this = unsafe {
-        this.cast::<CustomSerialIoProtocol>().as_mut().unwrap()
-    };
+    let this = unsafe { this.cast::<CustomSerialIoProtocol>().as_mut().unwrap() };
     if !this.initialized {
         this.init();
     }
     Status::UNSUPPORTED
 }
 
-unsafe extern "efiapi" fn serial_protocol_get_control_bits(this: *const SerialIoProtocol, bits: *mut ControlBits) -> Status {
+unsafe extern "efiapi" fn serial_protocol_get_control_bits(
+    this: *const SerialIoProtocol,
+    bits: *mut ControlBits,
+) -> Status {
     // SAFETY: We installed the protocol interface before and know the ABI.
-    let this = unsafe {
-        this.cast::<CustomSerialIoProtocol>().as_ref().unwrap()
-    };
+    let this = unsafe { this.cast::<CustomSerialIoProtocol>().as_ref().unwrap() };
     Status::UNSUPPORTED
-
 }
 
-unsafe extern "efiapi" fn serial_protocol_write(this: *mut SerialIoProtocol, len: *mut usize, data: *const u8) -> Status {
+unsafe extern "efiapi" fn serial_protocol_write(
+    this: *mut SerialIoProtocol,
+    len: *mut usize,
+    data: *const u8,
+) -> Status {
     // SAFETY: We installed the protocol interface before and know the ABI.
-    let this = unsafe {
-        this.cast::<CustomSerialIoProtocol>().as_mut().unwrap()
-    };
+    let this = unsafe { this.cast::<CustomSerialIoProtocol>().as_mut().unwrap() };
+    log::debug!("WAH");
     if !this.initialized {
+        log::debug!("WAH");
         this.init();
     }
 
+    log::debug!("WAH");
     let msg = unsafe { slice::from_raw_parts(data, *len) };
     let msg = str::from_utf8(msg).unwrap();
+    log::debug!("WAH: msg={msg}");
 
     //if !msg.is_empty() {
-        this.device.write_str(msg).unwrap();
+    this.device.write_str(msg).unwrap();
+    log::debug!("WAH");
     //}
 
     Status::SUCCESS
 }
 
-unsafe extern "efiapi" fn serial_protocol_read(this: *mut SerialIoProtocol, len: *mut usize, data: *mut u8) -> Status {
+unsafe extern "efiapi" fn serial_protocol_read(
+    this: *mut SerialIoProtocol,
+    len: *mut usize,
+    data: *mut u8,
+) -> Status {
     // SAFETY: We installed the protocol interface before and know the ABI.
-    let this = unsafe {
-        this.cast::<CustomSerialIoProtocol>().as_mut().unwrap()
-    };
+    let this = unsafe { this.cast::<CustomSerialIoProtocol>().as_mut().unwrap() };
     if !this.initialized {
         this.init();
     }
@@ -143,11 +186,9 @@ unsafe extern "efiapi" fn serial_protocol_read(this: *mut SerialIoProtocol, len:
         let byte = this.device.try_receive();
 
         match byte {
-            Ok(byte) => {
-                unsafe {
-                    data.add(i).write(byte);
-                }
-            }
+            Ok(byte) => unsafe {
+                data.add(i).write(byte);
+            },
             Err(_) => {
                 unsafe {
                     *len = i;
@@ -158,7 +199,6 @@ unsafe extern "efiapi" fn serial_protocol_read(this: *mut SerialIoProtocol, len:
     }
 
     Status::SUCCESS
-
 }
 
 /// Allocates a new handle for the port I/O mapped serial port (COM1 port) and
@@ -207,14 +247,16 @@ pub fn install() -> anyhow::Result<Handle> {
         device: unsafe { SerialPort::new(0x3f8) },
     };
 
-    let prot = INTERFACE.call_once(|| {
-        protocol_interface
-    });
+    let prot = INTERFACE.call_once(|| protocol_interface);
     let serial_interface_ptr = &raw const *prot;
     let dvp_interface_ptr = prot.device_path.as_ffi_ptr();
 
-    let handle = unsafe { boot::install_protocol_interface(None, &Serial::GUID, serial_interface_ptr.cast()) }?;
-    let _ = unsafe { boot::install_protocol_interface(Some(handle), &DevicePath::GUID, dvp_interface_ptr.cast()) }?;
+    let handle = unsafe {
+        boot::install_protocol_interface(None, &Serial::GUID, serial_interface_ptr.cast())
+    }?;
+    let _ = unsafe {
+        boot::install_protocol_interface(Some(handle), &DevicePath::GUID, dvp_interface_ptr.cast())
+    }?;
 
     Ok(handle)
 }

@@ -6,13 +6,16 @@ mod serial_impl;
 
 extern crate alloc;
 
-use alloc::vec;
-use anyhow::{anyhow, Context};
-use uefi::proto::driver::ComponentName2;
-use uefi::ResultExt;
 use {
     crate::chat::start_chat,
-    alloc::vec::Vec,
+    alloc::{
+        vec,
+        vec::Vec,
+    },
+    anyhow::{
+        Context,
+        anyhow,
+    },
     core::{
         hint,
         panic::PanicInfo,
@@ -24,6 +27,7 @@ use {
     },
     uefi::{
         Handle,
+        ResultExt,
         Status,
         boot::{
             self,
@@ -31,7 +35,10 @@ use {
             OpenProtocolParams,
         },
         helpers,
-        proto::console::serial::Serial,
+        proto::{
+            console::serial::Serial,
+            driver::ComponentName2,
+        },
         runtime::{
             self,
             ResetType,
@@ -50,7 +57,7 @@ fn handle_panic(info: &PanicInfo) -> ! {
 
 fn find_serial_handles() -> anyhow::Result<Vec<Handle>> {
     let mut handles = {
-        let result =  boot::find_handles::<Serial>();
+        let result = boot::find_handles::<Serial>();
         let status = result.status();
         match (result, status) {
             (Ok(handles), _) => handles,
@@ -86,7 +93,7 @@ fn inner_main() -> anyhow::Result<()> {
         system::firmware_vendor(),
         system::firmware_revision()
     );
-    
+
     serial_impl::install()?;
     let handles = find_serial_handles()?;
     start_chat(&handles)?;

@@ -202,7 +202,6 @@ mod console {
 /// Module for interaction with the serial device, which will act as
 /// [`ChatParticipant::Remote`].
 mod serial {
-    use log::debug;
     use {
         crate::chat::console,
         alloc::{
@@ -212,7 +211,10 @@ mod serial {
         },
         anyhow::Context,
         core::fmt::Write,
-        log::info,
+        log::{
+            debug,
+            info,
+        },
         uefi::{
             Handle,
             boot::{
@@ -418,7 +420,11 @@ pub fn start_chat(handles: &[Handle]) -> anyhow::Result<()> {
         // query latest data from data sources
         current_local_raw_input_new = console::try_read()?;
         current_remote_raw_input_new = serial::try_read(&mut serial_proto)?;
+        info!("serial data before normalization: {current_remote_raw_input_new:x?}");
+        info!("                                : {:x?}", str::from_utf8(&current_remote_raw_input_new));
         serial::normalize_vt100_input(&mut current_remote_raw_input_new);
+        info!("serial data after normalization : {current_remote_raw_input_new:x?}");
+        info!("                                : {:x?}", str::from_utf8(&current_remote_raw_input_new));
         current_local_raw_input_all.extend(&current_local_raw_input_new);
         current_remote_raw_input_all.extend(&current_remote_raw_input_new);
 
@@ -494,7 +500,7 @@ pub fn start_chat(handles: &[Handle]) -> anyhow::Result<()> {
             need_refresh = false;
         }
 
-        stall(Duration::from_millis(50));
+        stall(Duration::from_millis(1500));
     }
 
     Ok(())
