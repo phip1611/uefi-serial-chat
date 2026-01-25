@@ -1,3 +1,4 @@
+use alloc::fmt::format;
 use {
     alloc::{
         borrow::ToOwned,
@@ -106,13 +107,19 @@ mod helpers {
         });
         string
     }
+
+    /// Strips all backspaces from a string and returns the effective string.
+    pub fn strip_backspaces(string: String) -> String {
+        let bs_sequence = format!("{BACKSPACE} {BACKSPACE}");
+        string
+            .replace(&bs_sequence, "")
+            .replace(BACKSPACE, "")
+            .replace(DELETE, "")
+    }
 }
 
 mod actions {
-    use {
-        super::*,
-        uart_16550::backend::Backend,
-    };
+    use super::*;
 
     /// Prompts the user for input.
     ///
@@ -156,11 +163,44 @@ mod actions {
             break pos;
         };
 
+        // Print a newline after the user input
+        backend.write_char('\n')?;
+
+        // Remove anything after the newline.
         backend.read_buffer_mut().truncate(pos);
         let input = mem::replace(backend.read_buffer_mut(), String::new());
+        // Remove any intermediate backspaces and only keep the effective
+        // string.
+        let input = helpers::strip_backspaces(input);
 
         Ok(input)
     }
+
+    /// Prompts the user for input, wrapping [`prompt_user`].
+    ///
+    /// This method blocks until we received an answer.
+    ///
+    /// The returned string contains a whole line without the terminating
+    /// newline character. Further, all backspace/delete characters will be
+    /// stripped.
+    pub fn prompt_user_parse_and_validate<T>(
+        backend: &mut impl ChatBackend,
+        prompt: &str,
+        parse_fn: impl Fn(&str) -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        loop {
+            let input = prompt_user(backend, prompt)?;
+            match parse_fn(&input) {
+                Ok(value) => return Ok(value),
+                Err(_) => {
+                    continue;
+                }
+            }
+        }
+    }
+
+    /// Prompts the user
+    pub fn prompt_user_username(backend: &mut impl ChatBackend) {}
 
     /// Broadcasts a message to all backends.
     pub fn broadcast(msg: &str, backends: &mut [&mut dyn ChatBackend]) -> anyhow::Result<()> {
@@ -194,9 +234,6 @@ trait ChatBackend: fmt::Write {
 
     /// Clears the screen.
     fn clear_screen(&mut self) -> anyhow::Result<()>;
-
-    /// Returns a read reference underlying buffer of [`Self::poll`].
-    fn read_buffer(&self) -> &String;
 
     /// Returns a mutable reference underlying buffer of [`Self::poll`].
     fn read_buffer_mut(&mut self) -> &mut String;
@@ -271,10 +308,6 @@ impl ChatBackend for ConsoleBackend {
 
     fn clear_screen(&mut self) -> anyhow::Result<()> {
         with_stdout(|stdout| stdout.clear()).map_err(|e| e.into())
-    }
-
-    fn read_buffer(&self) -> &String {
-        &self.read_buffer
     }
 
     fn read_buffer_mut(&mut self) -> &mut String {
@@ -409,10 +442,6 @@ impl ChatBackend for SerialBackend {
         Ok(())
     }
 
-    fn read_buffer(&self) -> &String {
-        &self.read_buffer
-    }
-
     fn read_buffer_mut(&mut self) -> &mut String {
         &mut self.read_buffer
     }
@@ -461,10 +490,12 @@ pub fn start_chat(handles: &[Handle]) -> anyhow::Result<()> {
             &mut [&mut console_backend, &mut serial_backend],
         )?;
         actions::broadcast(
-            &format!("UEFI revision={}, vendor={}, version={}\n",
-                     system::uefi_revision(),
-                     system::firmware_vendor(),
-                     system::firmware_revision()),
+            &format!(
+                "UEFI revision={}, vendor={}, version={}\n",
+                system::uefi_revision(),
+                system::firmware_vendor(),
+                system::firmware_revision()
+            ),
             &mut [&mut console_backend, &mut serial_backend],
         )?;
         actions::broadcast(
@@ -473,8 +504,18 @@ pub fn start_chat(handles: &[Handle]) -> anyhow::Result<()> {
         )?;
     }
 
-    actions::prompt_user(&mut serial_backend, "Are you ready? ")?;
-    actions::prompt_user(&mut console_backend, "Are you ready? ")?;
+    serial_backend.write_str("Other user is selecting their name, please wait ...\n")?;
+    let local_username = actions::prompt_user(&mut console_backend, "Choose your username: ")?;
+    actions::broadcast(
+        &format!("Remote machine chose username: '{local_username}'\n"),
+        &mut [&mut console_backend, &mut serial_backend],
+    )?;
+    console_backend.write_str("Other user is selecting their name, please wait ...\n")?;
+    let remote_username = actions::prompt_user(&mut serial_backend, "Choose your username: ")?;
+    actions::broadcast(
+        &format!("Remote machine chose username: '{remote_username}'\n"),
+        &mut [&mut console_backend, &mut serial_backend],
+    )?;
 
     todo!();
 
@@ -485,7 +526,10 @@ pub fn start_chat(handles: &[Handle]) -> anyhow::Result<()> {
 mod tests {
     use {
         super::*,
-        crate::chat::helpers::string_limit_backspaces,
+        crate::chat::helpers::{
+            string_limit_backspaces,
+            strip_backspaces,
+        },
     };
 
     #[test]
@@ -522,6 +566,30 @@ mod tests {
         assert_eq!(
             string_limit_backspaces(String::from("\x7fH\x7f\x7f"), 3),
             "\x7fH\x7f\x7f"
+        );
+    }
+
+    #[test]
+    fn test_strip_backspaces() {
+        assert_eq!(
+            strip_backspaces(String::from("Hello, world!")),
+            "Hello, world!"
+        );
+        assert_eq!(
+            strip_backspaces(String::from("Hello, \x08 \x08world!")),
+            "Hello, world!"
+        );
+        assert_eq!(
+            strip_backspaces(String::from("Hello, \x08 \x08\x08world!")),
+            "Hello, world!"
+        );
+        assert_eq!(
+            strip_backspaces(String::from("Hello, \x08 \x08\x7fworld!")),
+            "Hello, world!"
+        );
+        assert_eq!(
+            strip_backspaces(String::from("Hello, \x7f\x08 \x08w\x7forld!")),
+            "Hello, world!"
         );
     }
 }
