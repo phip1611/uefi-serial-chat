@@ -87,19 +87,6 @@ fn find_serial_handles() -> anyhow::Result<Vec<Handle>> {
 fn inner_main() -> anyhow::Result<()> {
     helpers::init()?;
 
-    with_stdout(|stdout| write!(stdout, "Welcome to UEFI Serial Chat\r\n"))?;
-    with_stdout(|stdout| {
-        write!(
-            stdout,
-            "UEFI revision={}, vendor={}, version={}",
-            system::uefi_revision(),
-            system::firmware_vendor(),
-            system::firmware_revision()
-        )
-    })?;
-    // Write this to the screen as well as the serial connection.
-    with_stdout(|stdout| write!(stdout, "Chat will begin shortly ...\r\n"))?;
-
     // We always install our own SERIAL_IO protocol implementation:
     // - some UEFI on real hardware has no SERIAL_IO protocol implementation,
     //   even tho there is a UART 16550 and activated COM port

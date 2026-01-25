@@ -42,6 +42,7 @@ use {
             text::Key,
         },
         system::{
+            self,
             with_stdin,
             with_stdout,
         },
@@ -54,57 +55,120 @@ const BACKSPACE: char = '\x08';
 const DELETE_STR: &str = "\x7f";
 const BACKSPACE_STR: &str = "\x08";
 
-const FPS_60: Duration = Duration::from_millis( 1000 / 60);
+const FPS_60: Duration = Duration::from_millis(1000 / 60);
 
-#[derive(Copy, Clone, Debug)]
-enum ChatParticipant {
-    Local,
-    Remote,
-}
+mod helpers {
+    use super::*;
 
-/// Prints a chat message using the UEFI simple text output protocol.
-///
-/// It assumes that each messages is a single line.
-fn format_chat_message(participant: ChatParticipant, msg: &str) -> String {
-    let participant = format!("{:?}", participant).to_uppercase();
-    format!("[{participant:>6}]: {msg}")
-}
+    #[derive(Copy, Clone, Debug)]
+    pub enum ChatParticipant {
+        Local,
+        Remote,
+    }
 
-fn normalize_terminal_input(input: &str) -> String {
-    String::new()
-}
+    /// Prints a chat message using the UEFI simple text output protocol.
+    ///
+    /// It assumes that each messages is a single line.
+    pub fn format_chat_message(participant: ChatParticipant, msg: &str) -> String {
+        let participant = format!("{:?}", participant).to_uppercase();
+        format!("[{participant:>6}]: {msg}")
+    }
 
-/// Finds the first linebreak and return its position in the string.
-///
-/// This works for Rust strings as well as the input from the UEFI console or
-/// a serial terminal.
-fn find_first_linebreak(string: &str) -> Option<usize> {
-    ["\r\n", "\r", "\n"]
-        .iter()
-        .filter_map(|pattern| string.find(pattern))
-        .min()
-}
+    /// Finds the first linebreak and return its position in the string.
+    ///
+    /// This works for Rust strings as well as the input from the UEFI console or
+    /// a serial terminal.
+    pub fn find_first_linebreak(string: &str) -> Option<usize> {
+        ["\r\n", "\r", "\n"]
+            .iter()
+            .filter_map(|pattern| string.find(pattern))
+            .min()
+    }
 
-/// Limits the backspaces (ASCII BS (`0x09`) and DEL `(0x7f)`) in a string.
-///
-/// Only retains as many backspaces as there are printable characters.
-/// This helps to prevent removing characters from the screen that weren't part
-/// of the user input.
-fn string_limit_backspaces(mut string: String, mut allowed_bs: usize) -> String {
-    string.retain(|char| {
-        let slice = [BACKSPACE, DELETE];
-        if slice.contains(&char) {
-            return if allowed_bs > 0 {
-                allowed_bs -= 1;
-                true
+    /// Limits the backspaces (ASCII BS (`0x09`) and DEL `(0x7f)`) in a string.
+    ///
+    /// Only retains as many backspaces as there are printable characters.
+    /// This helps to prevent removing characters from the screen that weren't part
+    /// of the user input.
+    pub fn string_limit_backspaces(mut string: String, mut allowed_bs: usize) -> String {
+        string.retain(|char| {
+            let slice = [BACKSPACE, DELETE];
+            if slice.contains(&char) {
+                return if allowed_bs > 0 {
+                    allowed_bs -= 1;
+                    true
+                } else {
+                    false
+                };
             } else {
-                false
+                return true;
+            }
+        });
+        string
+    }
+}
+
+mod actions {
+    use {
+        super::*,
+        uart_16550::backend::Backend,
+    };
+
+    /// Prompts the user for input.
+    ///
+    /// This method blocks until we received an answer.
+    ///
+    /// The returned string contains a whole line without the terminating
+    /// newline character. Further, all backspace/delete characters will be
+    /// stripped.
+    pub fn prompt_user(backend: &mut impl ChatBackend, prompt: &str) -> anyhow::Result<String> {
+        // Amount of visible chars. This helps to keep track how many DEL/BS
+        // we can propagate to the backend to prevent deleting the prompt or
+        // anything other than the user input.
+        let mut visible_chars_n = 0;
+        backend.write_str(prompt)?;
+        // We continue until we've read a whole line.
+        let pos = loop {
+            // To owned: necessary to prevent borrowing issues.
+            let mut latest_input = backend.poll()?.to_owned();
+            // Remove superfluous backspaces, otherwise we will remove our
+            // prompt from the screen.
+            {
+                visible_chars_n += latest_input.chars().filter(|c| !c.is_control()).count();
+                latest_input = helpers::string_limit_backspaces(latest_input, visible_chars_n);
+                let backspace_n = latest_input
+                    .chars()
+                    .filter(|c| [BACKSPACE, DELETE].contains(c))
+                    .count();
+                // Now substract how many chars we just erased from the screen.
+                visible_chars_n = visible_chars_n.saturating_sub(backspace_n);
+            }
+            latest_input = backend.normalize_backspaces(latest_input);
+            // Actually write the input back to the user. Our backspace handling
+            // ensures that deleted characters are also erased from the screen.
+            backend.write_str(&latest_input)?;
+
+            // Did the user input a whole line?
+            let Some(pos) = helpers::find_first_linebreak(backend.read_buffer_mut()) else {
+                boot::stall(FPS_60);
+                continue;
             };
-        } else {
-            return true;
+            break pos;
+        };
+
+        backend.read_buffer_mut().truncate(pos);
+        let input = mem::replace(backend.read_buffer_mut(), String::new());
+
+        Ok(input)
+    }
+
+    /// Broadcasts a message to all backends.
+    pub fn broadcast(msg: &str, backends: &mut [&mut dyn ChatBackend]) -> anyhow::Result<()> {
+        for backend in backends {
+            backend.write_str(msg)?;
         }
-    });
-    string
+        Ok(())
+    }
 }
 
 /// Backend for a chat partner.
@@ -137,58 +201,11 @@ trait ChatBackend: fmt::Write {
     /// Returns a mutable reference underlying buffer of [`Self::poll`].
     fn read_buffer_mut(&mut self) -> &mut String;
 
-    /// Prompts the user for input.
-    ///
-    /// This method blocks until we received an answer.
-    ///
-    /// The returned string contains a whole line without the terminating
-    /// newline character. Further, all backspace/delete characters will be
-    /// stripped.
-    fn prompt_user(&mut self, prompt: &str) -> anyhow::Result<String> {
-        // Amount of visible chars. This helps to keep track how many DEL/BS
-        // we can propagate to the backend to prevent deleting the prompt or
-        // anything other than the user input.
-        let mut visible_chars_n = 0;
-        self.write_str(prompt)?;
-        // We continue until we've read a whole line.
-        let pos = loop {
-            // To owned: necessary to prevent borrowing issues.
-            let mut latest_input = self.poll()?.to_owned();
-            // Remove superfluous backspaces, otherwise we will remove our prompt
-            // from the screen.
-            {
-                visible_chars_n += latest_input.chars().filter(|c| !c.is_control()).count();
-                latest_input = string_limit_backspaces(latest_input, visible_chars_n);
-                let backspace_n = latest_input
-                    .chars()
-                    .filter(|c| [BACKSPACE, DELETE].contains(c))
-                    .count();
-                // Now clear how many chars we just erased from the screen.
-                visible_chars_n = visible_chars_n.saturating_sub(backspace_n);
-            }
-            latest_input = Self::normalize_backspaces(latest_input);
-            // Actually write the input back to the user. Our backspace handling
-            // ensures that deleted characters are also erased from the screen.
-            self.write_str(&latest_input)?;
-
-            let Some(pos) = find_first_linebreak(self.read_buffer_mut()) else {
-                boot::stall(FPS_60);
-                continue;
-            };
-            break pos;
-        };
-
-        self.read_buffer_mut().truncate(pos);
-        let input = mem::replace(self.read_buffer_mut(), String::new());
-
-        Ok(input)
-    }
-
     /// Normalizes backspaces for the given backend.
     ///
     /// This may replace BS with DEL or vice versa, or may replace a BS sequence
     /// with a `BS<space>BS` sequence.
-    fn normalize_backspaces(string: String) -> String {
+    fn normalize_backspaces(&self, string: String) -> String {
         string
     }
 }
@@ -211,7 +228,8 @@ impl ConsoleBackend {
 
 impl Write for ConsoleBackend {
     fn write_str(&mut self, s: &str) -> fmt::Result {
-        // TODO newline handling
+        let s = s.replace("\n", "\r\n");
+
         with_stdout(|stdout| write!(stdout, "{s}"))?;
         Ok(())
     }
@@ -250,7 +268,6 @@ impl ChatBackend for ConsoleBackend {
     fn clear_buffer(&mut self) {
         self.read_buffer.clear();
     }
-
 
     fn clear_screen(&mut self) -> anyhow::Result<()> {
         with_stdout(|stdout| stdout.clear()).map_err(|e| e.into())
@@ -330,8 +347,10 @@ impl SerialBackend {
 
 impl Write for SerialBackend {
     fn write_str(&mut self, s: &str) -> fmt::Result {
-        // TODO newline handling
+        let s = s.replace("\n", "\r\n");
+
         let mut remaining_bytes = s.as_bytes();
+        // We loop until all byte were written.
         loop {
             match self.protocol.write(s.as_bytes()) {
                 Ok(_) => break,
@@ -362,7 +381,8 @@ impl ChatBackend for SerialBackend {
                 Err(err) => return Err(err.into()),
             };
 
-            log::error!("read n byte {n}");
+            // TODO my own serial impl always return 10 zero bytes?!
+            //log::error!("read n byte {n}");
 
             // At this point, we might have broken a UTF-8 symbol in between.
             // We therefore use the intermediate buffer.
@@ -397,9 +417,10 @@ impl ChatBackend for SerialBackend {
         &mut self.read_buffer
     }
 
-    fn normalize_backspaces(mut string: String) -> String {
+    fn normalize_backspaces(&self, string: String) -> String {
         let bs_sequence = format!("{BACKSPACE} {BACKSPACE}");
-        string.replace(DELETE, BACKSPACE_STR)
+        string
+            .replace(DELETE, BACKSPACE_STR)
             .replace(BACKSPACE_STR, &bs_sequence)
     }
 }
@@ -419,10 +440,8 @@ pub fn start_chat(handles: &[Handle]) -> anyhow::Result<()> {
     // should select the built-in OVMF handle, not our self installed
     let handle = handles.first().unwrap();
 
-
     let mut console_backend = ConsoleBackend::new()?;
     let mut serial_backend = SerialBackend::new(handle.clone())?;
-
 
     // Clear any remaining data.
     {
@@ -435,7 +454,27 @@ pub fn start_chat(handles: &[Handle]) -> anyhow::Result<()> {
         serial_backend.clear_buffer();
     }
 
-    serial_backend.prompt_user("Are you ready? ")?;
+    // Welcome message
+    {
+        actions::broadcast(
+            "Welcome to UEFI Serial Chat\n",
+            &mut [&mut console_backend, &mut serial_backend],
+        )?;
+        actions::broadcast(
+            &format!("UEFI revision={}, vendor={}, version={}\n",
+                     system::uefi_revision(),
+                     system::firmware_vendor(),
+                     system::firmware_revision()),
+            &mut [&mut console_backend, &mut serial_backend],
+        )?;
+        actions::broadcast(
+            "Chat will begin shortly ...\n",
+            &mut [&mut console_backend, &mut serial_backend],
+        )?;
+    }
+
+    actions::prompt_user(&mut serial_backend, "Are you ready? ")?;
+    actions::prompt_user(&mut console_backend, "Are you ready? ")?;
 
     todo!();
 
@@ -444,10 +483,13 @@ pub fn start_chat(handles: &[Handle]) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use {
+        super::*,
+        crate::chat::helpers::string_limit_backspaces,
+    };
 
     #[test]
-    fn test_hello() {
+    fn test_string_limit_backspaces() {
         assert_eq!(
             string_limit_backspaces(String::from("Hello, world!"), 0),
             "Hello, world!"
