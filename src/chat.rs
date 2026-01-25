@@ -1,31 +1,60 @@
 use {
     alloc::{
+        borrow::ToOwned,
         collections::VecDeque,
         format,
         string::{
             String,
             ToString,
         },
-        vec::Vec,
+        vec::{
+            self,
+            Vec,
+        },
     },
     anyhow::anyhow,
     core::{
-        fmt::Write,
+        fmt::{
+            self,
+            Write,
+        },
+        iter,
+        mem,
         time::Duration,
     },
-    log::info,
+    log::{
+        error,
+        info,
+        warn,
+    },
+    uart_16550::spec::FIFO_SIZE,
     uefi::{
         Handle,
         boot::{
             self,
             OpenProtocolAttributes,
             OpenProtocolParams,
+            ScopedProtocol,
             stall,
         },
-        proto::console::serial::Serial,
-        system::with_stdout,
+        proto::console::{
+            serial::Serial,
+            text::Key,
+        },
+        system::{
+            with_stdin,
+            with_stdout,
+        },
     },
+    uefi_raw::Status,
 };
+
+const DELETE: char = '\x7f';
+const BACKSPACE: char = '\x08';
+const DELETE_STR: &str = "\x7f";
+const BACKSPACE_STR: &str = "\x08";
+
+const FPS_60: Duration = Duration::from_millis( 1000 / 60);
 
 #[derive(Copy, Clone, Debug)]
 enum ChatParticipant {
@@ -41,49 +70,161 @@ fn format_chat_message(participant: ChatParticipant, msg: &str) -> String {
     format!("[{participant:>6}]: {msg}")
 }
 
-/// Module for interaction with the UEFI console, which will act as
-/// [`ChatParticipant::Local`].
-///
-/// The console is what is handled by UEFI stdout and stdin service, which is
-/// backed by the simple text input/output protocols.
-mod console {
-    use {
-        alloc::{
-            string::String,
-            vec::Vec,
-        },
-        anyhow::anyhow,
-        core::fmt::Write,
-        log::{
-            warn,
-        },
-        uefi::{
-            boot,
-            proto::console::text::Key,
-            system::{
-                with_stdin,
-                with_stdout,
-            },
-        },
-    };
+fn normalize_terminal_input(input: &str) -> String {
+    String::new()
+}
 
-    /// Tries to read a message from the console, if there is any input.
+/// Finds the first linebreak and return its position in the string.
+///
+/// This works for Rust strings as well as the input from the UEFI console or
+/// a serial terminal.
+fn find_first_linebreak(string: &str) -> Option<usize> {
+    ["\r\n", "\r", "\n"]
+        .iter()
+        .filter_map(|pattern| string.find(pattern))
+        .min()
+}
+
+/// Limits the backspaces (ASCII BS (`0x09`) and DEL `(0x7f)`) in a string.
+///
+/// Only retains as many backspaces as there are printable characters.
+/// This helps to prevent removing characters from the screen that weren't part
+/// of the user input.
+fn string_limit_backspaces(mut string: String, mut allowed_bs: usize) -> String {
+    string.retain(|char| {
+        let slice = [BACKSPACE, DELETE];
+        if slice.contains(&char) {
+            return if allowed_bs > 0 {
+                allowed_bs -= 1;
+                true
+            } else {
+                false
+            };
+        } else {
+            return true;
+        }
+    });
+    string
+}
+
+/// Backend for a chat partner.
+///
+/// All backends are expected to support UTF-8 and take of the translation of
+/// certain control characters and newlines between the output device and
+/// normal Rust strings. All implementations of [`fmt::Write`] must take care of
+/// proper newline handling on the remote.
+trait ChatBackend: fmt::Write {
+    /// Polls the underlying backend for newly available data and updates the
+    /// internal queue of unprocessed raw input.
     ///
-    /// The data that we read from the underlying source will be provided as
-    /// [`Char16`]. We skip some unused special key codes and only return
-    /// printable characters as well as typical ASCII control characters, such
-    /// as backspace. Newlines will be represented as `\r\n`.
+    /// Assumes that all incoming data is valid UTF-8.
     ///
-    /// [`Char16`]: uefi::Char16
-    pub fn try_read() -> anyhow::Result<Vec<char>> {
-        let event =
-            with_stdin(|input| input.wait_for_key_event()).ok_or(anyhow!("missing event"))?;
-        if !boot::check_event(event)? {
-            return Ok(Vec::new());
+    /// Returns a UTF-8–encoded `str` containing the newly polled data. If a
+    /// UTF-8 code point is received only partially, it is buffered internally
+    /// and emitted on a subsequent invocation once the complete sequence has
+    /// been received.
+    fn poll(&mut self) -> anyhow::Result<&'_ str>;
+
+    /// Clears all internal buffers.
+    fn clear_buffer(&mut self);
+
+    /// Clears the screen.
+    fn clear_screen(&mut self) -> anyhow::Result<()>;
+
+    /// Returns a read reference underlying buffer of [`Self::poll`].
+    fn read_buffer(&self) -> &String;
+
+    /// Returns a mutable reference underlying buffer of [`Self::poll`].
+    fn read_buffer_mut(&mut self) -> &mut String;
+
+    /// Prompts the user for input.
+    ///
+    /// This method blocks until we received an answer.
+    ///
+    /// The returned string contains a whole line without the terminating
+    /// newline character. Further, all backspace/delete characters will be
+    /// stripped.
+    fn prompt_user(&mut self, prompt: &str) -> anyhow::Result<String> {
+        // Amount of visible chars. This helps to keep track how many DEL/BS
+        // we can propagate to the backend to prevent deleting the prompt or
+        // anything other than the user input.
+        let mut visible_chars_n = 0;
+        self.write_str(prompt)?;
+        // We continue until we've read a whole line.
+        let pos = loop {
+            // To owned: necessary to prevent borrowing issues.
+            let mut latest_input = self.poll()?.to_owned();
+            // Remove superfluous backspaces, otherwise we will remove our prompt
+            // from the screen.
+            {
+                visible_chars_n += latest_input.chars().filter(|c| !c.is_control()).count();
+                latest_input = string_limit_backspaces(latest_input, visible_chars_n);
+                let backspace_n = latest_input
+                    .chars()
+                    .filter(|c| [BACKSPACE, DELETE].contains(c))
+                    .count();
+                // Now clear how many chars we just erased from the screen.
+                visible_chars_n = visible_chars_n.saturating_sub(backspace_n);
+            }
+            latest_input = Self::normalize_backspaces(latest_input);
+            // Actually write the input back to the user. Our backspace handling
+            // ensures that deleted characters are also erased from the screen.
+            self.write_str(&latest_input)?;
+
+            let Some(pos) = find_first_linebreak(self.read_buffer_mut()) else {
+                boot::stall(FPS_60);
+                continue;
+            };
+            break pos;
+        };
+
+        self.read_buffer_mut().truncate(pos);
+        let input = mem::replace(self.read_buffer_mut(), String::new());
+
+        Ok(input)
+    }
+
+    /// Normalizes backspaces for the given backend.
+    ///
+    /// This may replace BS with DEL or vice versa, or may replace a BS sequence
+    /// with a `BS<space>BS` sequence.
+    fn normalize_backspaces(string: String) -> String {
+        string
+    }
+}
+
+/// Backend for the UEFI console which operates on the EFI_SIMPLE_TEXT_INPUT and
+/// EFI_SIMPLE_TEXT_OUTPUT protocols.
+struct ConsoleBackend {
+    // UTF-8 input but ASCII control characters, such as delete and backspace.
+    read_buffer: String,
+}
+
+impl ConsoleBackend {
+    fn new() -> anyhow::Result<Self> {
+        let this = Self {
+            read_buffer: String::new(),
+        };
+        Ok(this)
+    }
+}
+
+impl Write for ConsoleBackend {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        // TODO newline handling
+        with_stdout(|stdout| write!(stdout, "{s}"))?;
+        Ok(())
+    }
+}
+
+impl ChatBackend for ConsoleBackend {
+    fn poll(&mut self) -> anyhow::Result<&'_ str> {
+        let event = with_stdin(|input| input.wait_for_key_event())?;
+        if !boot::check_event(&event)? {
+            return Ok("");
         }
 
-        let mut data = Vec::new();
-
+        let old_len = self.read_buffer.len();
         // Read all available keystrokes and collect them in the vec.
         loop {
             let res = with_stdin(|input| input.read_key())?;
@@ -96,279 +237,177 @@ mod console {
             };
 
             match key {
-                Key::Printable(c) => data.push(char::from(c)),
+                Key::Printable(c) => self.read_buffer.push(char::from(c)),
                 Key::Special(c) => {
                     warn!("Ignoring special key: {c:?}");
                 }
             }
         }
 
-        Ok(data)
+        Ok(&self.read_buffer[old_len..])
     }
 
-    /// Prompts the user for its input.
-    ///
-    /// As the user types, their typed characters will be shown to the screen.
-    pub fn prompt_input(prompt_msg: &str) -> anyhow::Result<String> {
-        if !prompt_msg.is_empty() {
-            with_stdout(|stdout| stdout.write_str(prompt_msg))?;
-        }
-
-        let event =
-            with_stdin(|input| input.wait_for_key_event()).ok_or(anyhow!("missing event"))?;
-        let wait_events = &mut [event];
-        let mut input = String::new();
-        loop {
-            // Wait for next keystroke.
-            boot::wait_for_event(wait_events)?;
-            let key = with_stdin(|input| input.read_key())?
-                .ok_or(anyhow!("missing input when an event was signaled"))?;
-
-            match key {
-                Key::Printable(c) => {
-                    let c = char::from(c);
-                    match c {
-                        '\u{8}' /* backspace */ => {
-                            if input.len() > 1 {
-                                input.remove(input.len() - 1);
-                                // UEFI console handles a backspace properly on
-                                // screen already by default.
-                                with_stdout(|stdout| stdout.write_char(c))?;
-                            }
-                        }
-                        '\r' /* enter */ => {
-                            input.push_str("\r\n");
-                            with_stdout(|stdout| stdout.write_str("\r\n"))?;
-                            break;
-                        }
-                        // 0-9, A-Z, a-z
-                        c if c.is_ascii_alphanumeric() => {
-                            input.push(c);
-                            // type what the user just printed
-                            with_stdout(|stdout| stdout.write_char(c))?;
-                        }
-                        c if c.is_ascii_punctuation() => {
-                            input.push(c);
-                            // type what the user just printed
-                            with_stdout(|stdout| stdout.write_char(c))?;
-                        }
-                        c => {
-                            return Err(anyhow!("Unsupported character: {c:?}"));
-                        }
-                    }
-                }
-                Key::Special(c) => {
-                    warn!("received special key code that will be ignored: {c:?}");
-                }
-            }
-        }
-        Ok(input)
+    fn clear_buffer(&mut self) {
+        self.read_buffer.clear();
     }
 
-    /// Extracts all complete UTF-8–encoded lines from the buffer and returns
-    /// them as a single `String`, possibly including control characters
-    /// such as backspace (`0x8`.
-    ///
-    /// The returned string does **not** include the final newline character.
-    /// All bytes corresponding to the returned lines are removed from `data`.
-    /// All `\r\n` sequences will be replaced by `\n`.
-    ///
-    /// # Returns
-    ///
-    /// - `Ok(Some(String))` if at least one complete line was extracted.
-    /// - `Ok(None)` if no complete line is present in the buffer.
-    /// - `Err(_)` if UTF-8 validation or conversion fails.
-    pub fn remove_lines_to_string(data: &mut Vec<char>) -> anyhow::Result<Option<String>> {
-        // We search for the last newline.
-        let pos = data.iter().rposition(|char| *char == '\r');
-        if pos.is_none() {
-            return Ok(None);
-        }
-        let pos = pos.unwrap();
-        let lines = &data[0..pos];
-        let lines = lines.iter().collect::<String>();
-        let lines = lines.replace("\r\n", "\n");
 
-        // remove everything including the newline
-        for _ in 0..=pos {
-            data.remove(0);
-        }
+    fn clear_screen(&mut self) -> anyhow::Result<()> {
+        with_stdout(|stdout| stdout.clear()).map_err(|e| e.into())
+    }
 
-        Ok(Some(lines))
+    fn read_buffer(&self) -> &String {
+        &self.read_buffer
+    }
+
+    fn read_buffer_mut(&mut self) -> &mut String {
+        &mut self.read_buffer
     }
 }
 
-/// Module for interaction with the serial device, which will act as
-/// [`ChatParticipant::Remote`].
-mod serial {
-    use {
-        crate::chat::console,
-        alloc::{
-            format,
-            string::String,
-            vec::Vec,
-        },
-        anyhow::Context,
-        core::fmt::Write,
-        log::{
-            debug,
-            info,
-        },
-        uefi::{
-            Handle,
-            boot::{
-                self,
-                OpenProtocolAttributes,
-                OpenProtocolParams,
-            },
-            proto::{
-                console::serial::Serial,
-                device_path::{
-                    DevicePath,
-                    text::{
-                        AllowShortcuts,
-                        DisplayOnly,
-                    },
+/// Backend for a serial device which is accessed via a SERIAL_IO_PROTOCOL
+/// handle.
+///
+/// The remote is expected to be a VT100-like terminal.
+struct SerialBackend {
+    handle: Handle,
+    protocol: ScopedProtocol<Serial>,
+    // UTF-8 input but ASCII control characters, such as delete and backspace.
+    read_buffer: String,
+    // Raw byte input buffer. Data transitions from here to the read buffer for
+    // every valid UTF-8 symbol.
+    read_buffer_raw: Vec<u8>,
+}
+
+impl SerialBackend {
+    fn new(handle: Handle) -> anyhow::Result<Self> {
+        let protocol = unsafe {
+            boot::open_protocol(
+                OpenProtocolParams {
+                    handle,
+                    agent: boot::image_handle(),
+                    controller: None,
                 },
-            },
-        },
-    };
-
-    /// Prompts the user with the available handles and a request to select one of
-    /// those.
-    ///
-    /// Returns the selected handle.
-    pub fn select_handle(handles: &[Handle]) -> anyhow::Result<(usize /* index */, Handle)> {
-        assert!(!handles.is_empty());
-
-        info!("Found the following handles supporting the Serial protocol:");
-        for (i, handle) in handles.iter().enumerate() {
-            let dvp = unsafe {
-                boot::open_protocol::<DevicePath>(
-                    OpenProtocolParams {
-                        handle: *handle,
-                        agent: boot::image_handle(),
-                        controller: None,
-                    },
-                    OpenProtocolAttributes::GetProtocol,
-                )
-            }?;
-            let dvp_string = dvp.to_string(DisplayOnly(true), AllowShortcuts(true))?;
-            info!("  {i}:  {dvp_string}");
-        }
-
-        if handles.len() == 1 {
-            // Automatically select the first handle.
-            Ok((0, handles[0]))
-        } else {
-            let msg = format!("Please select a serial handle (0..{}): ", handles.len() - 1);
-            let selection = console::prompt_input(&msg)?;
-            // remove newline
-            let selection = selection.trim();
-            let selection =
-                usize::from_str_radix(selection, 10).context("parsing selection as number")?;
-
-            Ok((selection, handles[selection]))
-        }
+                OpenProtocolAttributes::GetProtocol,
+            )
+        }?;
+        let this = Self {
+            handle,
+            protocol,
+            read_buffer: String::new(),
+            read_buffer_raw: Vec::with_capacity(4),
+        };
+        Ok(this)
     }
 
-    /// Sets up the input handling and the serial device.
-    pub fn setup(serial: &mut Serial) -> anyhow::Result<()> {
-        info!("Setting up serial device:");
-        // Prepare serial mode.
-        {
-            let mode = {
-                let mut mode = *serial.io_mode();
-                // At least in OVMF, setting this to 0, will cause an override
-                // with the default. Therefore, we put a minimum value here for
-                // low latency.
-                mode.timeout = 1 /* us*/;
-                mode
-            };
-            serial.set_attributes(&mode)?;
-            debug!("  io_mode: {:#?}", serial.io_mode());
+    /// Removes all complete UTF-8 symbols from the vector and pushes them to
+    /// the string.
+    fn drain_complete_utf8(buf: &mut Vec<u8>, out: &mut String) {
+        // Fast path: everything is valid UTF-8
+        if let Ok(s) = str::from_utf8(buf) {
+            out.push_str(s);
+            buf.clear();
+            return;
         }
 
+        // Otherwise, find the longest valid UTF-8 prefix
+        let mut valid_up_to = 0;
+
+        for i in 1..=buf.len() {
+            if str::from_utf8(&buf[..i]).is_ok() {
+                valid_up_to = i;
+            }
+        }
+
+        if valid_up_to > 0 {
+            // SAFETY: we just validated this prefix as UTF-8
+            let s = unsafe { str::from_utf8_unchecked(&buf[..valid_up_to]) };
+            out.push_str(s);
+            buf.drain(..valid_up_to);
+        }
+    }
+}
+
+impl Write for SerialBackend {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        // TODO newline handling
+        let mut remaining_bytes = s.as_bytes();
+        loop {
+            match self.protocol.write(s.as_bytes()) {
+                Ok(_) => break,
+                Err(err) if err.status() == Status::TIMEOUT => {
+                    let n = *err.data();
+                    remaining_bytes = &remaining_bytes[n..];
+                    continue;
+                }
+                Err(err) => {
+                    error!("failed to write to serial: {err:#?}");
+                    return Err(fmt::Error);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl ChatBackend for SerialBackend {
+    fn poll(&mut self) -> anyhow::Result<&'_ str> {
+        // first: read raw bytes
+        {
+            let mut buf = [0; FIFO_SIZE];
+
+            let n = match self.protocol.read(&mut buf) {
+                Ok(_) => buf.len(),
+                Err(err) if err.status() == Status::TIMEOUT => *err.data(),
+                Err(err) => return Err(err.into()),
+            };
+
+            log::error!("read n byte {n}");
+
+            // At this point, we might have broken a UTF-8 symbol in between.
+            // We therefore use the intermediate buffer.
+            for byte in buf.into_iter().take(n) {
+                self.read_buffer_raw.push(byte)
+            }
+        }
+        // second: move valid UTF-8 to string
+        let old_len = self.read_buffer.len();
+        Self::drain_complete_utf8(&mut self.read_buffer_raw, &mut self.read_buffer);
+
+        Ok(&self.read_buffer[old_len..])
+    }
+
+    fn clear_buffer(&mut self) {
+        self.read_buffer_raw.clear();
+        self.read_buffer.clear();
+    }
+
+    fn clear_screen(&mut self) -> anyhow::Result<()> {
+        // VT100 ANSI escape sequence to clear the screen.
+        // This is the same as the `clear` command in a terminal.
+        self.write_str("\x1b[H\x1b[2J\x1b[3J")?;
         Ok(())
     }
 
-    /// Writes a message to the serial device.
-    pub fn write(serial: &mut Serial, msg: &str) -> anyhow::Result<()> {
-        serial.write_str(msg).map_err(|e| e.into())
+    fn read_buffer(&self) -> &String {
+        &self.read_buffer
     }
 
-    /// Normalizes the input coming from the serial device, which is most likely
-    /// coming from a VT100-compatible terminal emulator.
-    pub fn normalize_vt100_input(data: &mut [u8]) {
-        // normalize backspace
-        data.iter_mut()
-            .filter(|char| **char == '\u{7f}' as u8)
-            .for_each(|char| {
-                *char = '\u{8}' as u8;
-            });
+    fn read_buffer_mut(&mut self) -> &mut String {
+        &mut self.read_buffer
     }
 
-    /// Normalizes the output we want to print.
-    ///
-    /// - make sure a backspace also removes the character and not just
-    ///   clears the space
-    pub fn normalize_vt100_output(data: &mut String) {
-        let mut char_i = data.chars().count();
-        while char_i > 0 {
-            // Get the previous char boundary
-            let (byte_i, ch) = data.char_indices().nth(char_i - 1).unwrap();
-            if ch == '\u{8}' {
-                // Insert a space and then the backspace at the current position
-                data.insert(byte_i, ' ');
-                data.insert(byte_i, '\u{8}');
-            }
-            char_i = char_i - 1;
-        }
-    }
-
-    /// Tries to read the latest raw data from the serial device, if it received
-    /// any from the remote so far.
-    ///
-    /// The data is raw and unprocessed, but likely to be valid UTF-8 with
-    /// some control characters.
-    pub fn try_read(serial: &mut Serial) -> anyhow::Result<Vec<u8>> {
-        serial.read_to_end().map_err(|e| e.into())
-    }
-
-    /// Extracts all complete UTF-8–encoded lines from the buffer and returns them
-    /// as a single normalized `String`, possibly including control characters
-    /// such as backspace (`0x8`).
-    ///
-    /// The returned string does **not** include the final newline character.
-    /// All bytes corresponding to the returned lines are removed from `data`.
-    ///
-    /// # Returns
-    ///
-    /// - `Ok(Some(String))` if at least one complete line was extracted.
-    /// - `Ok(None)` if no complete line is present in the buffer.
-    /// - `Err(_)` if UTF-8 validation or conversion fails.
-    pub fn remove_lines_to_string(data: &mut Vec<u8>) -> anyhow::Result<Option<String>> {
-        // We search for the last newline.
-        // In a serial terminal by convention, the terminal will send a `\r` for
-        // a newline.
-        let pos = data.iter().rposition(|char| *char == b'\r');
-        if pos.is_none() {
-            return Ok(None);
-        }
-        let pos = pos.unwrap();
-        let lines = &data[0..pos];
-        let lines = String::from_utf8(lines.to_vec())?;
-
-        // remove everything including the newline
-        for _ in 0..=pos {
-            data.remove(0);
-        }
-
-        Ok(Some(lines))
+    fn normalize_backspaces(mut string: String) -> String {
+        let bs_sequence = format!("{BACKSPACE} {BACKSPACE}");
+        string.replace(DELETE, BACKSPACE_STR)
+            .replace(BACKSPACE_STR, &bs_sequence)
     }
 }
 
 /// Starts a chat with the serial device.
+///
+/// This expects that the UEFI console is already disconnected from any serial
+/// handle.
 ///
 /// This machine is `[LOCAL]` and the data received via serial is `[REMOTE]`.
 pub fn start_chat(handles: &[Handle]) -> anyhow::Result<()> {
@@ -376,131 +415,71 @@ pub fn start_chat(handles: &[Handle]) -> anyhow::Result<()> {
         return Err(anyhow!("No Serial handle available!"));
     }
 
-    let (serial_handle_i, serial_handle) = serial::select_handle(handles)?;
-    info!("Chosen handle {serial_handle_i}");
+    // TODO select handle
+    // should select the built-in OVMF handle, not our self installed
+    let handle = handles.first().unwrap();
 
-    let mut serial_proto = unsafe {
-        boot::open_protocol::<Serial>(
-            OpenProtocolParams {
-                handle: serial_handle,
-                agent: boot::image_handle(),
-                controller: None,
-            },
-            OpenProtocolAttributes::GetProtocol,
-        )?
-    };
 
-    serial::setup(&mut serial_proto)?;
-    info!("Successfully set up input and serial device!");
-    info!("  LOCAL : USB keyboard input");
-    info!("  REMOTE: Serial input");
+    let mut console_backend = ConsoleBackend::new()?;
+    let mut serial_backend = SerialBackend::new(handle.clone())?;
 
-    console::prompt_input("Ready to enter chat? Press ENTER.")?;
 
-    // Disconnect any serial handle from the console device.
-    // At this point, no more normal logging output will be sent to the serial
-    // device.
-    for handle in handles {
-        boot::disconnect_controller(*handle, None, None)?;
+    // Clear any remaining data.
+    {
+        console_backend.clear_screen()?;
+        let _ = console_backend.poll()?;
+        console_backend.clear_buffer();
+
+        serial_backend.clear_screen()?;
+        let _ = serial_backend.poll()?;
+        serial_backend.clear_buffer();
     }
 
-    // Current raw processed input including control characters.
-    let mut current_local_raw_input_all = Vec::new();
-    let mut current_remote_raw_input_all = Vec::new();
-    let mut current_local_raw_input_new;
-    let mut current_remote_raw_input_new;
+    serial_backend.prompt_user("Are you ready? ")?;
 
-    // all parsed messages from old to new
-    let mut messages = VecDeque::<(ChatParticipant, String)>::new();
-
-    let mut need_refresh = true;
-    // Refetch the latest data and redraw the game board + prompts all the time.
-    loop {
-        // query latest data from data sources
-        current_local_raw_input_new = console::try_read()?;
-        current_remote_raw_input_new = serial::try_read(&mut serial_proto)?;
-        //info!("serial data before normalization: {current_remote_raw_input_new:x?}");
-        //info!("                                : {:x?}", str::from_utf8(&current_remote_raw_input_new));
-        serial::normalize_vt100_input(&mut current_remote_raw_input_new);
-        //info!("serial data after normalization : {current_remote_raw_input_new:x?}");
-        //info!("                                : {:x?}", str::from_utf8(&current_remote_raw_input_new));
-        current_local_raw_input_all.extend(&current_local_raw_input_new);
-        current_remote_raw_input_all.extend(&current_remote_raw_input_new);
-
-        // Process raw input, extract lines, and put that into `messages`
-        {
-            let lines = console::remove_lines_to_string(&mut current_local_raw_input_all)?;
-            if let Some(lines) = lines {
-                need_refresh = true;
-                for line in lines.lines() {
-                    messages.push_back((ChatParticipant::Local, line.to_string()));
-                }
-            }
-            let lines = serial::remove_lines_to_string(&mut current_remote_raw_input_all)?;
-            if let Some(lines) = lines {
-                need_refresh = true;
-                for line in lines.lines() {
-                    messages.push_back((ChatParticipant::Remote, line.to_string()));
-                }
-            }
-        }
-
-        // remove messages in case we have too many on the screen
-        if need_refresh
-        /* just added a new message */
-        {
-            while messages.len() > 20 {
-                messages.pop_front();
-            }
-        }
-
-        if need_refresh {
-            // Clear screens
-            {
-                // local
-                with_stdout(|output| output.clear())?;
-                // for remote:
-                // Assuming the workload uses a VT100-compatible terminal
-                // emulator: clear screen, clear line, cursor to pos 1:1
-                serial::write(&mut serial_proto, &"\x1B[2J\x1B[H")?;
-            }
-
-            // Print all messages as single lines.
-            for (participant, message) in &messages {
-                let mut message = format_chat_message(*participant, message);
-                with_stdout(|stdout| stdout.write_str(&message))?;
-                with_stdout(|stdout| stdout.write_str("\r\n"))?;
-                serial::normalize_vt100_output(&mut message);
-                serial::write(&mut serial_proto, &message)?;
-                serial::write(&mut serial_proto, "\r\n")?;
-            }
-        }
-
-        // print each user what they are currently typing
-        {
-            let input = if need_refresh {
-                current_local_raw_input_all.iter().collect::<String>()
-            } else {
-                current_local_raw_input_new.iter().collect::<String>()
-            };
-            with_stdout(|stdout| stdout.write_str(&input))?;
-
-            let input = if need_refresh {
-                String::from_utf8_lossy(&current_remote_raw_input_all)
-            } else {
-                String::from_utf8_lossy(&current_remote_raw_input_new)
-            };
-            let mut input = input.to_string();
-            serial::normalize_vt100_output(&mut input);
-            serial::write(&mut serial_proto, &input)?;
-        }
-
-        if need_refresh {
-            need_refresh = false;
-        }
-
-        stall(Duration::from_millis(50));
-    }
+    todo!();
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_hello() {
+        assert_eq!(
+            string_limit_backspaces(String::from("Hello, world!"), 0),
+            "Hello, world!"
+        );
+        assert_eq!(
+            string_limit_backspaces(String::from("Hello, world!"), 5),
+            "Hello, world!"
+        );
+
+        assert_eq!(
+            string_limit_backspaces(String::from("Hello, \x7fw\x7fo\x7fr\x7fl\x7fd\x7f!"), 10),
+            "Hello, \x7fw\x7fo\x7fr\x7fl\x7fd\x7f!"
+        );
+        assert_eq!(
+            string_limit_backspaces(String::from("Hello, \x7fw\x7fo\x7fr\x7fl\x7fd\x7f!"), 1),
+            "Hello, \x7fworld!"
+        );
+        assert_eq!(
+            string_limit_backspaces(String::from("Hello, \x7fw\x7fo\x7fr\x7fl\x7fd\x7f!"), 0),
+            "Hello, world!"
+        );
+        assert_eq!(
+            string_limit_backspaces(String::from("\x7fH\x7f\x7f"), 0),
+            "H"
+        );
+        assert_eq!(
+            string_limit_backspaces(String::from("\x7fH\x7f\x7f"), 2),
+            "\x7fH\x7f"
+        );
+        assert_eq!(
+            string_limit_backspaces(String::from("\x7fH\x7f\x7f"), 3),
+            "\x7fH\x7f\x7f"
+        );
+    }
 }

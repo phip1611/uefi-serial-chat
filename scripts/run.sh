@@ -18,12 +18,13 @@ cp "$EFI_FILE" "$BOOT_VOL/EFI/BOOT/BOOTX64.EFI"
 # We pretend we have systemd-boot here to test the chain loading
 cp "$EFI_FILE" "$BOOT_VOL/EFI/systemd/systemd-bootx64.efi"
 
+# Uart16550 connected to pseudo terminal => we can connect `minicom` to the VM
+#  -device pci-serial,chardev=charserial0,addr=0x10 \
 qemu-system-x86_64 \
     -bios $OVMF \
     -chardev pty,id=charserial0 \
     -cpu qemu64 \
     -debugcon file:debugcon.txt \
-    -device pci-serial,chardev=charserial0,addr=0x10 \
     -display gtk \
     -drive "format=raw,file=fat:rw:$BOOT_VOL" \
     -m 512M \

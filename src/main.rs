@@ -1,10 +1,13 @@
 #![no_std]
-#![no_main]
+#![cfg_attr(not(test), no_main)]
 
 mod chat;
 mod serial_impl;
 
 extern crate alloc;
+
+#[cfg(test)]
+extern crate std;
 
 use {
     crate::chat::start_chat,
@@ -12,10 +15,9 @@ use {
         vec,
         vec::Vec,
     },
-    anyhow::{
-        Context
-    },
+    anyhow::Context,
     core::{
+        fmt::Write,
         hint,
         panic::PanicInfo,
         time::Duration,
@@ -34,18 +36,19 @@ use {
             OpenProtocolParams,
         },
         helpers,
-        proto::{
-            console::serial::Serial
-        },
+        proto::console::serial::Serial,
         runtime::{
             self,
             ResetType,
         },
-        system,
+        system::{
+            self,
+            with_stdout,
+        },
     },
 };
 
-#[panic_handler]
+#[cfg_attr(not(test), panic_handler)]
 fn handle_panic(info: &PanicInfo) -> ! {
     error!("PANIC: {}", info);
     loop {
@@ -84,22 +87,41 @@ fn find_serial_handles() -> anyhow::Result<Vec<Handle>> {
 fn inner_main() -> anyhow::Result<()> {
     helpers::init()?;
 
-    info!("Hello World from uefi-serial-chat");
-    info!(
-        "UEFI revision={}, vendor={}, version={}",
-        system::uefi_revision(),
-        system::firmware_vendor(),
-        system::firmware_revision()
-    );
+    with_stdout(|stdout| write!(stdout, "Welcome to UEFI Serial Chat\r\n"))?;
+    with_stdout(|stdout| {
+        write!(
+            stdout,
+            "UEFI revision={}, vendor={}, version={}",
+            system::uefi_revision(),
+            system::firmware_vendor(),
+            system::firmware_revision()
+        )
+    })?;
+    // Write this to the screen as well as the serial connection.
+    with_stdout(|stdout| write!(stdout, "Chat will begin shortly ...\r\n"))?;
 
-    serial_impl::install()?;
-    let handles = find_serial_handles()?;
-    start_chat(&handles)?;
+    // We always install our own SERIAL_IO protocol implementation:
+    // - some UEFI on real hardware has no SERIAL_IO protocol implementation,
+    //   even tho there is a UART 16550 and activated COM port
+    // - this helps to develop it easily when running it in a VM
+    let _ = serial_impl::install()?;
+
+    let serial_handles = find_serial_handles()?;
+    // Disconnect any serial handle from the console device to:
+    //
+    // - UEFI console won't write to the screen AND the serial device
+    // - We have exclusive device control, which we need to install our own
+    //   protocol implementation
+    for handle in &serial_handles {
+        boot::disconnect_controller(*handle, None, None)?;
+    }
+
+    start_chat(&serial_handles)?;
 
     Ok(())
 }
 
-#[uefi::entry]
+#[cfg_attr(not(test), uefi::entry)]
 fn main() -> Status {
     if let Err(e) = inner_main() {
         error!("\n{e:?}");
@@ -109,4 +131,12 @@ fn main() -> Status {
     error!("Reached end of main() function. Shutting down in {seconds}s");
     boot::stall(Duration::from_secs(seconds));
     runtime::reset(ResetType::SHUTDOWN, Status::SUCCESS, None);
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn test_hello() {
+        std::println!("Hello, world!");
+    }
 }

@@ -3,15 +3,27 @@
 
 #![allow(static_mut_refs)]
 
-use anyhow::Context;
-use serial_16550::{BaudRate, DataBits, SerialConfig, StopBits, Uart16550Port};
 use {
     alloc::{
         boxed::Box,
         vec::Vec,
     },
     core::slice,
-    log::debug,
+    uart_16550::{
+        BaudRate,
+        Config as Uart16550Config,
+        Uart16550,
+        backend::PioBackend,
+        spec::{
+            CLK_FREQUENCY_HZ,
+            registers::{
+                FifoTriggerLevel,
+                IER,
+                Parity,
+                WordLength,
+            },
+        },
+    },
     uefi::{
         Handle,
         Identify,
@@ -35,10 +47,10 @@ use {
         Status,
         protocol::console::serial::{
             ControlBits,
-            Parity,
+            Parity as EfiParity,
             SerialIoMode,
             SerialIoProtocol,
-            StopBits as UefiStopBits,
+            StopBits as EfiStopBits,
         },
     },
 };
@@ -52,10 +64,30 @@ struct CustomSerialIoProtocol {
     /* End ABI-compatible portion: now extra stuff */
     mode: SerialIoMode,
     device_path: Box<DevicePath>,
-    device: Uart16550Port,
+    device: Uart16550<PioBackend>,
+    is_initialized: bool,
 }
 
 impl CustomSerialIoProtocol {
+    fn init_if_necessary(&mut self) {
+        if !self.is_initialized {
+            self.is_initialized = true;
+            self.init_device(Default::default());
+        }
+    }
+
+    fn init_device(&mut self, config: Uart16550Config) {
+        self.device
+            .init(config)
+            .expect("should initialize serial port");
+        self.device
+            .test_loopback()
+            .expect("should perform serial loopback test");
+        self.device
+            .check_remote_ready_to_receive()
+            .expect("should check remote ready to receive");
+    }
+
     /// Updates the [`IoMode`] in the protocol and also in hardware.
     fn update_io_mode(&mut self, new_io_mode: IoMode) {
         self.mode = new_io_mode;
@@ -64,20 +96,32 @@ impl CustomSerialIoProtocol {
         self.inner.mode = ptr;
 
         // Update the hardware.
-        let config = SerialConfig {
-            baud_rate: BaudRate::try_from_value(u32::try_from(new_io_mode.baud_rate).unwrap()).unwrap(),
-            data_bits: DataBits::try_from_value(u32::try_from(new_io_mode.data_bits).unwrap()).unwrap(),
-            stop_bits: match new_io_mode.stop_bits {
-                UefiStopBits::ONE => StopBits::One,
-                UefiStopBits::DEFAULT => StopBits::One,
-                UefiStopBits::ONE_FIVE => StopBits::One,
-                UefiStopBits::TWO => StopBits::Two,
-                val=> panic!("invalid value: {val:?}")
+        let config = Uart16550Config {
+            interrupts: IER::empty(),
+            frequency: CLK_FREQUENCY_HZ,
+            prescaler_division_factor: None,
+            fifo_trigger_level: Some(FifoTriggerLevel::Fourteen),
+            baud_rate: BaudRate::Baud115200,
+            data_bits: WordLength::from_integer(u8::try_from(new_io_mode.data_bits).unwrap()),
+            extra_stop_bits: match new_io_mode.stop_bits {
+                EfiStopBits::DEFAULT => false,
+                EfiStopBits::ONE => false,
+                EfiStopBits::TWO => true,
+                EfiStopBits::ONE_FIVE => true,
+                _ => false,
+            },
+            parity: match new_io_mode.parity {
+                EfiParity::DEFAULT => Parity::Disabled,
+                EfiParity::NONE => Parity::Disabled,
+                EfiParity::ODD => Parity::Odd,
+                EfiParity::EVEN => Parity::Even,
+                EfiParity::MARK => Parity::Disabled,
+                EfiParity::SPACE => Parity::Disabled,
+                _ => Parity::Disabled,
             },
         };
-        unsafe {
-            self.device.init(&config);
-        }
+
+        self.init_device(config);
     }
 }
 
@@ -87,23 +131,23 @@ unsafe impl Send for CustomSerialIoProtocol {}
 unsafe impl Sync for CustomSerialIoProtocol {}
 
 unsafe extern "efiapi" fn serial_protocol_reset(this: *mut SerialIoProtocol) -> Status {
-    debug!("hello");
     // SAFETY: We installed the protocol interface before and know the ABI.
-    let this = unsafe { this.cast::<CustomSerialIoProtocol>().as_mut().unwrap() };
+    let _this = unsafe { this.cast::<CustomSerialIoProtocol>().as_mut().unwrap() };
     Status::UNSUPPORTED
 }
 
 unsafe extern "efiapi" fn serial_protocol_set_attributes(
-    this: *mut SerialIoProtocol,
+    this: *const SerialIoProtocol,
     baud_rate: u64,
     receive_fifo_depth: u32,
     timeout: u32,
-    parity: Parity,
+    parity: EfiParity,
     data_bits: u8,
-    stop_bits: UefiStopBits,
+    stop_bits: EfiStopBits,
 ) -> Status {
     // SAFETY: We installed the protocol interface before and know the ABI.
-    let this = unsafe { this.cast::<CustomSerialIoProtocol>().as_mut().unwrap() };
+    let this = unsafe { this.cast_mut().cast::<CustomSerialIoProtocol>().as_mut().unwrap() };
+    this.init_if_necessary();
     let attributes = IoMode {
         baud_rate,
         parity,
@@ -120,19 +164,20 @@ unsafe extern "efiapi" fn serial_protocol_set_attributes(
 
 unsafe extern "efiapi" fn serial_protocol_set_control_bits(
     this: *mut SerialIoProtocol,
-    bits: ControlBits,
+    _bits: ControlBits,
 ) -> Status {
     // SAFETY: We installed the protocol interface before and know the ABI.
     let this = unsafe { this.cast::<CustomSerialIoProtocol>().as_mut().unwrap() };
+    this.init_if_necessary();
     Status::UNSUPPORTED
 }
 
 unsafe extern "efiapi" fn serial_protocol_get_control_bits(
     this: *const SerialIoProtocol,
-    bits: *mut ControlBits,
+    _bits: *mut ControlBits,
 ) -> Status {
     // SAFETY: We installed the protocol interface before and know the ABI.
-    let this = unsafe { this.cast::<CustomSerialIoProtocol>().as_ref().unwrap() };
+    let _this = unsafe { this.cast::<CustomSerialIoProtocol>().as_ref().unwrap() };
     Status::UNSUPPORTED
 }
 
@@ -143,11 +188,13 @@ unsafe extern "efiapi" fn serial_protocol_write(
 ) -> Status {
     // SAFETY: We installed the protocol interface before and know the ABI.
     let this = unsafe { this.cast::<CustomSerialIoProtocol>().as_mut().unwrap() };
+    this.init_if_necessary();
 
     let msg = unsafe { slice::from_raw_parts(data, *len) };
 
-    this.device.write_bytes_saturating(msg);
+    this.device.send_bytes_all(msg);
 
+    // TODO: We currently totally ignore the timeout semantics of this protocol.
     Status::SUCCESS
 }
 
@@ -158,15 +205,25 @@ unsafe extern "efiapi" fn serial_protocol_read(
 ) -> Status {
     // SAFETY: We installed the protocol interface before and know the ABI.
     let this = unsafe { this.cast::<CustomSerialIoProtocol>().as_mut().unwrap() };
+    this.init_if_necessary();
+    
+    // SAFETY: Layout is valid.
+    let len = unsafe { len.as_mut().expect("should be not null") };
 
+    // SAFETY: We know the layout and trust the caller.
     let slice = unsafe { slice::from_raw_parts_mut(data, *len) };
-    let n = this.device.read_bytes(slice);
-
-    unsafe {
-        *len = n;
+    
+    // TODO: We currently ignore proper timeout handling.
+    // It should nevertheless be correct to just return early with 
+    // Status::TIMEOUT, as the caller then has to fetch more frequently.
+    let n = this.device.receive_bytes(slice);
+    *len = n;
+    
+    if n == *len {
+        Status::SUCCESS
+    } else {
+        Status::TIMEOUT
     }
-
-    Status::SUCCESS
 }
 
 /// Allocates a new handle for the port I/O mapped serial port (COM1 port) and
@@ -189,14 +246,11 @@ pub fn install() -> anyhow::Result<Handle> {
     // Further, it is okay if this lives for the whole time of the application.
     //let device_path = Box::leak(device_path);
 
-    let mut device = unsafe { Uart16550Port::new(0x3f8) };
-    unsafe {
-        device.test_loopback().context("performing serial loopback test")?;
-    };
+    let device = unsafe { Uart16550::new_port(0x3f8) }?;
 
     let protocol_interface = CustomSerialIoProtocol {
         inner: SerialIoProtocol {
-            revision: 1,
+            revision: SerialIoProtocol::REVISION,
             reset: serial_protocol_reset,
             set_attributes: serial_protocol_set_attributes,
             set_control_bits: serial_protocol_set_control_bits,
@@ -207,16 +261,17 @@ pub fn install() -> anyhow::Result<Handle> {
         },
         mode: SerialIoMode {
             control_mask: Default::default(),
-            timeout: 1, /* µs */
+            timeout: 1000, /* µs */
             baud_rate: 115200,
             receive_fifo_depth: 16,
             data_bits: 8,
-            parity: Parity::NONE,
-            stop_bits: UefiStopBits::ONE,
+            parity: EfiParity::NONE,
+            stop_bits: EfiStopBits::ONE,
         },
         device_path,
         // SAFETY: We know the device is there.
-        device
+        device,
+        is_initialized: false,
     };
 
     let _ = unsafe { INTERFACE.call_once(|| protocol_interface) };
