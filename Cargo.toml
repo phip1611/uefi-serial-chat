@@ -16,8 +16,9 @@ uart_16550 = { path = "../uart_16550" }
 uefi = { version = "0.36", default-features = false, features = ["alloc", "log-debugcon", "logger"] }
 uefi-raw = { version = "0.13" }
 
+# Exclude the global allocator for `cargo test`
 [target.'cfg(target_os = "uefi")'.dependencies]
-uefi = { version = "0.36", default-features = false, features = ["global_allocator"] }
+uefi = { version = "0.36", default-features = false,  features = ["global_allocator"] }
 
 [patch.crates-io]
 uefi = { path = "../uefi-rs/uefi" }

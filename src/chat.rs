@@ -1,8 +1,8 @@
-use alloc::fmt::format;
 use {
     alloc::{
         borrow::ToOwned,
         collections::VecDeque,
+        fmt::format,
         format,
         string::{
             String,
@@ -119,7 +119,17 @@ mod helpers {
 }
 
 mod actions {
-    use super::*;
+    use {
+        super::*,
+        core::str::FromStr,
+        uefi::proto::device_path::{
+            DevicePath,
+            text::{
+                AllowShortcuts,
+                DisplayOnly,
+            },
+        },
+    };
 
     /// Prompts the user for input.
     ///
@@ -183,7 +193,7 @@ mod actions {
     /// The returned string contains a whole line without the terminating
     /// newline character. Further, all backspace/delete characters will be
     /// stripped.
-    pub fn prompt_user_parse_and_validate<T>(
+    fn _prompt_user_for_value<T>(
         backend: &mut impl ChatBackend,
         prompt: &str,
         parse_fn: impl Fn(&str) -> anyhow::Result<T>,
@@ -199,8 +209,19 @@ mod actions {
         }
     }
 
-    /// Prompts the user
-    pub fn prompt_user_username(backend: &mut impl ChatBackend) {}
+    /// Prompts the user until its input can be converted to the desired value.
+    pub fn prompt_user_for_value<T: FromStr>(
+        backend: &mut impl ChatBackend,
+        prompt: &str,
+    ) -> anyhow::Result<T>
+    where
+        <T as FromStr>::Err: core::error::Error + Send + Sync + 'static,
+    {
+        let t = _prompt_user_for_value(backend, prompt, |input| {
+            T::from_str(input).map_err(|e| anyhow::Error::new(e))
+        })?;
+        Ok(t)
+    }
 
     /// Broadcasts a message to all backends.
     pub fn broadcast(msg: &str, backends: &mut [&mut dyn ChatBackend]) -> anyhow::Result<()> {
@@ -208,6 +229,41 @@ mod actions {
             backend.write_str(msg)?;
         }
         Ok(())
+    }
+
+    /// Prompts the user to select a handle.
+    pub fn select_serial_handle(
+        backend: &mut impl ChatBackend,
+        handles: &[Handle],
+    ) -> anyhow::Result<Handle> {
+        backend.write_str("Available handles supporting the SERIAL_IO protocol:\n")?;
+
+        if handles.is_empty() {
+            anyhow::bail!("no handles available!")
+        }
+
+        for (i, handle) in handles.iter().enumerate() {
+            let dvp = {
+                let proto = unsafe {
+                    boot::open_protocol::<DevicePath>(
+                        OpenProtocolParams {
+                            handle: *handle,
+                            agent: boot::image_handle(),
+                            controller: None,
+                        },
+                        OpenProtocolAttributes::GetProtocol,
+                    )?
+                };
+                proto.to_string(DisplayOnly(true), AllowShortcuts(true))?
+            };
+            let msg = format!("[{i}]: {dvp}\n");
+            backend.write_str(&msg)?;
+        }
+
+        let index =
+            prompt_user_for_value::<usize>(backend, "Please select a handle (0, 1, 2, ...): ")?;
+
+        Ok(handles[index].clone())
     }
 }
 
@@ -465,12 +521,10 @@ pub fn start_chat(handles: &[Handle]) -> anyhow::Result<()> {
         return Err(anyhow!("No Serial handle available!"));
     }
 
-    // TODO select handle
-    // should select the built-in OVMF handle, not our self installed
-    let handle = handles.first().unwrap();
-
     let mut console_backend = ConsoleBackend::new()?;
-    let mut serial_backend = SerialBackend::new(handle.clone())?;
+    let handle = actions::select_serial_handle(&mut console_backend, handles)?;
+
+    let mut serial_backend = SerialBackend::new(handle)?;
 
     // Clear any remaining data.
     {
@@ -504,18 +558,30 @@ pub fn start_chat(handles: &[Handle]) -> anyhow::Result<()> {
         )?;
     }
 
-    serial_backend.write_str("Other user is selecting their name, please wait ...\n")?;
-    let local_username = actions::prompt_user(&mut console_backend, "Choose your username: ")?;
-    actions::broadcast(
-        &format!("Remote machine chose username: '{local_username}'\n"),
-        &mut [&mut console_backend, &mut serial_backend],
-    )?;
-    console_backend.write_str("Other user is selecting their name, please wait ...\n")?;
-    let remote_username = actions::prompt_user(&mut serial_backend, "Choose your username: ")?;
-    actions::broadcast(
-        &format!("Remote machine chose username: '{remote_username}'\n"),
-        &mut [&mut console_backend, &mut serial_backend],
-    )?;
+    // User name prompts
+    {
+        serial_backend.write_str("Other user is selecting their name, please wait ...\n")?;
+        let local_username = actions::prompt_user(&mut console_backend, "Choose your username: ")?;
+        actions::broadcast(
+            &format!("Local machine chose username : '{local_username}'\n"),
+            &mut [&mut console_backend, &mut serial_backend],
+        )?;
+        console_backend.write_str("Other user is selecting their name, please wait ...\n")?;
+        let remote_username = actions::prompt_user(&mut serial_backend, "Choose your username: ")?;
+        actions::broadcast(
+            &format!("Remote machine chose username: '{remote_username}'\n"),
+            &mut [&mut console_backend, &mut serial_backend],
+        )?;
+    }
+
+    // Actual chat
+    loop {
+        let mut needs_refresh = true;
+        if needs_refresh {
+            console_backend.clear_screen()?;
+            serial_backend.clear_screen()?;
+        }
+    }
 
     todo!();
 
