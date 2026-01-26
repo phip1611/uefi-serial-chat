@@ -192,7 +192,7 @@ unsafe extern "efiapi" fn serial_protocol_write(
 
     let msg = unsafe { slice::from_raw_parts(data, *len) };
 
-    this.device.send_bytes_all(msg);
+    this.device.send_bytes_exact(msg);
 
     // TODO: We currently totally ignore the timeout semantics of this protocol.
     Status::SUCCESS
@@ -206,19 +206,19 @@ unsafe extern "efiapi" fn serial_protocol_read(
     // SAFETY: We installed the protocol interface before and know the ABI.
     let this = unsafe { this.cast::<CustomSerialIoProtocol>().as_mut().unwrap() };
     this.init_if_necessary();
-    
+
     // SAFETY: Layout is valid.
     let len = unsafe { len.as_mut().expect("should be not null") };
 
     // SAFETY: We know the layout and trust the caller.
     let slice = unsafe { slice::from_raw_parts_mut(data, *len) };
-    
+
     // TODO: We currently ignore proper timeout handling.
-    // It should nevertheless be correct to just return early with 
+    // It should nevertheless be correct to just return early with
     // Status::TIMEOUT, as the caller then has to fetch more frequently.
     let n = this.device.receive_bytes(slice);
     *len = n;
-    
+
     if n == *len {
         Status::SUCCESS
     } else {

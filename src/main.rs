@@ -86,7 +86,6 @@ fn find_serial_handles() -> anyhow::Result<Vec<Handle>> {
 
 fn inner_main() -> anyhow::Result<()> {
     helpers::init()?;
-
     // We always install our own SERIAL_IO protocol implementation:
     // - some UEFI on real hardware has no SERIAL_IO protocol implementation,
     //   even tho there is a UART 16550 and activated COM port
@@ -111,7 +110,7 @@ fn inner_main() -> anyhow::Result<()> {
 #[cfg_attr(not(test), uefi::entry)]
 fn main() -> Status {
     if let Err(e) = inner_main() {
-        error!("\n{e:?}");
+        error!("\n{e}\n{e:#}\n{e:#?}");
     }
 
     let seconds = 20;

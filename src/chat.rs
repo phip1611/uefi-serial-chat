@@ -469,13 +469,11 @@ impl ChatBackend for SerialBackend {
                 Err(err) if err.status() == Status::TIMEOUT => *err.data(),
                 Err(err) => return Err(err.into()),
             };
-
-            // TODO my own serial impl always return 10 zero bytes?!
-            //log::error!("read n byte {n}");
+            let buf = &buf[..n];
 
             // At this point, we might have broken a UTF-8 symbol in between.
             // We therefore use the intermediate buffer.
-            for byte in buf.into_iter().take(n) {
+            for &byte in buf.into_iter().take(n) {
                 self.read_buffer_raw.push(byte)
             }
         }
