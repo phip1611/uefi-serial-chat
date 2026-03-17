@@ -93,8 +93,9 @@ fn inner_main() -> anyhow::Result<()> {
     let _ = serial_impl::install()?;
 
     let serial_handles = find_serial_handles()?;
-    // Disconnect any serial handle from the console device to:
+    // Disconnect any serial handle from the console device:
     //
+    // - UEFI console won't read its input from that device
     // - UEFI console won't write to the screen AND the serial device
     // - We have exclusive device control, which we need to install our own
     //   protocol implementation

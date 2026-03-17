@@ -546,7 +546,7 @@ impl ChatBackend for SerialBackend {
         let bs_sequence = format!("{BACKSPACE} {BACKSPACE}");
         string
             .replace(DELETE, BACKSPACE_STR)
-            .replace(BACKSPACE_STR, &bs_sequence)
+            .replace(BACKSPACE, &bs_sequence)
     }
 }
 
@@ -649,9 +649,17 @@ pub fn start_chat(handles: &[Handle]) -> anyhow::Result<()> {
 
         // We directly prompt each user with its current output
         let input = console_backend.poll()?.to_string();
-        write!(console_backend, "{}", console_backend.normalize_backspaces(input))?;
+        write!(
+            console_backend,
+            "{}",
+            console_backend.normalize_backspaces(input)
+        )?;
         let input = serial_backend.poll()?.to_string();
-        write!(serial_backend, "{}", serial_backend.normalize_backspaces(input))?;
+        write!(
+            serial_backend,
+            "{}",
+            serial_backend.normalize_backspaces(input)
+        )?;
 
         if let Some(line) = console_backend.read_line() {
             message_queue.push_back((ChatParticipant::Local, line));
