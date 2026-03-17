@@ -1,4 +1,5 @@
 use {
+    crate::chat::helpers::ChatParticipant,
     alloc::{
         borrow::ToOwned,
         collections::VecDeque,
@@ -294,12 +295,53 @@ trait ChatBackend: fmt::Write {
     /// Returns a mutable reference underlying buffer of [`Self::poll`].
     fn read_buffer_mut(&mut self) -> &mut String;
 
-    /// Normalizes backspaces for the given backend.
+    /// Normalizes backspaces for the given backend so that printing to the
+    /// screen overrides previously printed characters.
     ///
     /// This may replace BS with DEL or vice versa, or may replace a BS sequence
     /// with a `BS<space>BS` sequence.
     fn normalize_backspaces(&self, string: String) -> String {
         string
+    }
+
+    /// Tries to read a line from the underlying buffer.
+    ///
+    /// Removes the line from the underlying buffer.
+    ///
+    /// The returned string will be normalized and not contain any
+    /// `<DEL><SPACE><DEL>` sequences. It does not contain the final newline.
+    fn read_line(&mut self) -> Option<String> {
+        let buf = self.read_buffer_mut();
+        let bytes = buf.as_bytes();
+
+        for i in 0..bytes.len() {
+            match bytes[i] {
+                b'\n' => {
+                    let mut line = buf[..i].to_string();
+
+                    if line.ends_with('\r') {
+                        line.pop(); // handle \r\n
+                    }
+
+                    buf.drain(..=i);
+                    return Some(line);
+                }
+                b'\r' => {
+                    if i + 1 < bytes.len() && bytes[i + 1] == b'\n' {
+                        let line = buf[..i].to_string();
+                        buf.drain(..=i + 1);
+                        return Some(line);
+                    } else {
+                        let line = buf[..i].to_string();
+                        buf.drain(..=i);
+                        return Some(line);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        None
     }
 }
 
@@ -557,28 +599,71 @@ pub fn start_chat(handles: &[Handle]) -> anyhow::Result<()> {
     }
 
     // User name prompts
+    let local_username;
+    let remote_username;
     {
         serial_backend.write_str("Other user is selecting their name, please wait ...\n")?;
-        let local_username = actions::prompt_user(&mut console_backend, "Choose your username: ")?;
+        local_username = actions::prompt_user(&mut console_backend, "Choose your username: ")?;
         actions::broadcast(
             &format!("Local machine chose username : '{local_username}'\n"),
             &mut [&mut console_backend, &mut serial_backend],
         )?;
         console_backend.write_str("Other user is selecting their name, please wait ...\n")?;
-        let remote_username = actions::prompt_user(&mut serial_backend, "Choose your username: ")?;
+        remote_username = actions::prompt_user(&mut serial_backend, "Choose your username: ")?;
         actions::broadcast(
             &format!("Remote machine chose username: '{remote_username}'\n"),
             &mut [&mut console_backend, &mut serial_backend],
         )?;
     }
 
+    let mut message_queue = VecDeque::new();
+    let mut need_redraw_message_history = true;
+
     // Actual chat
     loop {
-        let mut needs_refresh = true;
-        if needs_refresh {
+        if need_redraw_message_history {
             console_backend.clear_screen()?;
             serial_backend.clear_screen()?;
         }
+
+        while message_queue.len() > 10 {
+            message_queue.pop_front();
+        }
+
+        if need_redraw_message_history {
+            for (participant, msg) in &message_queue {
+                let username = match participant {
+                    ChatParticipant::Local => &local_username,
+                    ChatParticipant::Remote => &remote_username,
+                };
+                actions::broadcast(
+                    &format!("[{username}]: {msg}\n"),
+                    &mut [&mut console_backend, &mut serial_backend],
+                )?;
+            }
+        }
+
+        if need_redraw_message_history {
+            need_redraw_message_history = false;
+        }
+
+        // We directly prompt each user with its current output
+        let input = console_backend.poll()?.to_string();
+        write!(console_backend, "{}", console_backend.normalize_backspaces(input))?;
+        let input = serial_backend.poll()?.to_string();
+        write!(serial_backend, "{}", serial_backend.normalize_backspaces(input))?;
+
+        if let Some(line) = console_backend.read_line() {
+            message_queue.push_back((ChatParticipant::Local, line));
+            need_redraw_message_history = true;
+        }
+
+        if let Some(line) = serial_backend.read_line() {
+            message_queue.push_back((ChatParticipant::Remote, line));
+            need_redraw_message_history = true;
+        }
+
+        stall(Duration::from_millis(100))
     }
 
     todo!();

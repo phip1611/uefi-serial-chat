@@ -84,7 +84,7 @@ impl CustomSerialIoProtocol {
             .test_loopback()
             .expect("should perform serial loopback test");
         self.device
-            .check_remote_ready_to_receive()
+            .check_conncected()
             .expect("should check remote ready to receive");
     }
 
@@ -137,7 +137,7 @@ unsafe extern "efiapi" fn serial_protocol_reset(this: *mut SerialIoProtocol) -> 
 }
 
 unsafe extern "efiapi" fn serial_protocol_set_attributes(
-    this: *const SerialIoProtocol,
+    this: *mut SerialIoProtocol,
     baud_rate: u64,
     receive_fifo_depth: u32,
     timeout: u32,
@@ -146,7 +146,7 @@ unsafe extern "efiapi" fn serial_protocol_set_attributes(
     stop_bits: EfiStopBits,
 ) -> Status {
     // SAFETY: We installed the protocol interface before and know the ABI.
-    let this = unsafe { this.cast_mut().cast::<CustomSerialIoProtocol>().as_mut().unwrap() };
+    let this = unsafe { this.cast::<CustomSerialIoProtocol>().as_mut().unwrap() };
     this.init_if_necessary();
     let attributes = IoMode {
         baud_rate,
@@ -216,7 +216,7 @@ unsafe extern "efiapi" fn serial_protocol_read(
     // TODO: We currently ignore proper timeout handling.
     // It should nevertheless be correct to just return early with
     // Status::TIMEOUT, as the caller then has to fetch more frequently.
-    let n = this.device.receive_bytes(slice);
+    let n = this.device.try_receive_bytes(slice);
     *len = n;
 
     if n == *len {
