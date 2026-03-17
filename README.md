@@ -1,5 +1,8 @@
 # uefi-serial-chat
 
+Code here is a bit… adventurous. Definitely more “YOLO” than my usual style.
+Please bear with me! 😉
+
 ## TL;DR
 
 UEFI chat application written in Rust where the machine booting the software is
