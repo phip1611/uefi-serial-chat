@@ -83,9 +83,9 @@ impl CustomSerialIoProtocol {
         self.device
             .test_loopback()
             .expect("should perform serial loopback test");
-        /*self.device
+        self.device
             .check_connected()
-            .expect("should check remote ready to receive");*/
+            .expect("should check remote ready to receive");
     }
 
     /// Updates the [`IoMode`] in the protocol and also in hardware.
