@@ -85,6 +85,7 @@ impl CustomSerialIoProtocol {
             .expect("should perform serial loopback test");
         // Fails as DSR is not set when booted on real hardware. I think this
         // used to work?! TODO Investigate
+        //stall(1ms) might fix the issue?
         /*self.device
             .check_connected()
             .expect("should check remote ready to receive")*/;
@@ -122,6 +123,8 @@ impl CustomSerialIoProtocol {
                 _ => Parity::Disabled,
             },
         };
+
+        log::debug!("Updating serial config: {config:#?}");
 
         self.init_device(config);
     }
@@ -283,6 +286,8 @@ pub fn install() -> anyhow::Result<Handle> {
     unsafe {
         let prot = INTERFACE.get_mut().unwrap();
         prot.update_io_mode(prot.mode);
+        let dump = prot.device.config_register_dump();
+        log::info!("{dump:#?}");
     }
     let prot = unsafe { INTERFACE.get().unwrap() };
     let serial_interface_ptr = &raw const *prot;
