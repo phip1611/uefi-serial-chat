@@ -123,7 +123,7 @@ impl CustomSerialIoProtocol {
             },
         };
 
-        log::debug!("Updating serial config: {config:#?}");
+        log::debug!("Updating serial config: {config:?}");
 
         self.init_device(config);
     }
@@ -287,6 +287,7 @@ pub fn install() -> anyhow::Result<Handle> {
         prot.update_io_mode(prot.mode);
         let dump = prot.device.config_register_dump();
         log::info!("{dump:#?}");
+        log::info!("Baud rate: {:?}", dump.baud_rate(prot.device.config().0));
     }
     let prot = unsafe { INTERFACE.get().unwrap() };
     let serial_interface_ptr = &raw const *prot;
