@@ -85,10 +85,9 @@ impl CustomSerialIoProtocol {
             .expect("should perform serial loopback test");
         // Fails as DSR is not set when booted on real hardware. I think this
         // used to work?! TODO Investigate
-        //stall(1ms) might fix the issue?
-        /*self.device
+        self.device
             .check_connected()
-            .expect("should check remote ready to receive")*/;
+            .expect("should check remote ready to receive")
     }
 
     /// Updates the [`IoMode`] in the protocol and also in hardware.
