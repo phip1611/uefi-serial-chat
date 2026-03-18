@@ -84,7 +84,7 @@ impl CustomSerialIoProtocol {
             .test_loopback()
             .expect("should perform serial loopback test");
         self.device
-            .check_conncected()
+            .check_connected()
             .expect("should check remote ready to receive");
     }
 
