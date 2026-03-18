@@ -217,11 +217,12 @@ unsafe extern "efiapi" fn serial_protocol_read(
     // It should nevertheless be correct to just return early with
     // Status::TIMEOUT, as the caller then has to fetch more frequently.
     let n = this.device.try_receive_bytes(slice);
-    *len = n;
 
     if n == *len {
+        *len = n;
         Status::SUCCESS
     } else {
+        *len = n;
         Status::TIMEOUT
     }
 }
