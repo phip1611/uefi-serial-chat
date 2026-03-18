@@ -8,10 +8,15 @@ use {
         boxed::Box,
         vec::Vec,
     },
-    core::slice,
+    core::{
+        slice,
+        time::Duration,
+    },
+    log::info,
     uart_16550::{
         BaudRate,
         Config as Uart16550Config,
+        RemoteReadyToReceiveError,
         Uart16550,
         backend::PioBackend,
         spec::{
@@ -83,11 +88,18 @@ impl CustomSerialIoProtocol {
         self.device
             .test_loopback()
             .expect("should perform serial loopback test");
-        // Fails as DSR is not set when booted on real hardware. I think this
-        // used to work?! TODO Investigate
-        self.device
-            .check_connected()
-            .expect("should check remote ready to receive")
+
+        let attempts = 6;
+        for attempt in 0..attempts {
+            match self.device.check_connected() {
+                Ok(_) => break,
+                Err(_err) if attempt < (attempts - 1) => {
+                    info!("Waiting for serial remote ...");
+                    boot::stall(Duration::from_millis(50));
+                }
+                Err(err) => panic!("failed to find a serial remote: {}", err),
+            }
+        }
     }
 
     /// Updates the [`IoMode`] in the protocol and also in hardware.
