@@ -3,11 +3,13 @@
 
 #![allow(static_mut_refs)]
 
+use uart_16550::ByteSendError;
 use {
     alloc::{
         boxed::Box,
         vec::Vec,
     },
+    uefi_raw::protocol::console::serial::SerialIoProtocolRevision,
     core::slice,
     uart_16550::{
         BaudRate,
@@ -98,7 +100,7 @@ impl CustomSerialIoProtocol {
             frequency: CLK_FREQUENCY_HZ,
             prescaler_division_factor: None,
             fifo_trigger_level: Some(FifoTriggerLevel::Fourteen),
-            baud_rate: BaudRate::Baud115200,
+            baud_rate: BaudRate::default(),
             data_bits: WordLength::from_integer(u8::try_from(new_io_mode.data_bits).unwrap()),
             extra_stop_bits: match new_io_mode.stop_bits {
                 EfiStopBits::DEFAULT => false,
@@ -190,11 +192,27 @@ unsafe extern "efiapi" fn serial_protocol_write(
     this.init_if_necessary();
 
     let msg = unsafe { slice::from_raw_parts(data, *len) };
+    let mut remaining_msg = msg;
 
-    this.device.send_bytes_exact(msg);
+    let mut n_total = 0;
+    // We send bytes until the device can't handle more writes.
+    // We ignore any timeout semantics in this simplified impl.
+    loop {
+        let n =this.device.send_bytes(remaining_msg);
+        remaining_msg = &remaining_msg[n..];
+        n_total += n;
+        if n == 0 {
+            break;
+        }
+    }
 
-    // TODO: We currently totally ignore the timeout semantics of this protocol.
-    Status::SUCCESS
+    unsafe {*len = n_total};
+
+    if n_total == msg.len() {
+        Status::SUCCESS
+    } else {
+        Status::TIMEOUT
+    }
 }
 
 unsafe extern "efiapi" fn serial_protocol_read(
@@ -206,22 +224,27 @@ unsafe extern "efiapi" fn serial_protocol_read(
     let this = unsafe { this.cast::<CustomSerialIoProtocol>().as_mut().unwrap() };
     this.init_if_necessary();
 
-    // SAFETY: Layout is valid.
-    let len = unsafe { len.as_mut().expect("should be not null") };
-
     // SAFETY: We know the layout and trust the caller.
-    let slice = unsafe { slice::from_raw_parts_mut(data, *len) };
+    let buffer = unsafe { slice::from_raw_parts_mut(data, *len) };
+    let mut remaining_buffer = &mut buffer[..];
 
-    // TODO: We currently ignore proper timeout handling.
-    // It should nevertheless be correct to just return early with
-    // Status::TIMEOUT, as the caller then has to fetch more frequently.
-    let n = this.device.try_receive_bytes(slice);
+    let mut n_total = 0;
+    // We read bytes until the device can't provide us with more data.
+    // We ignore any timeout semantics in this simplified impl.
+    loop {
+        let n =this.device.receive_bytes(remaining_buffer);
+        remaining_buffer = &mut remaining_buffer[n..];
+        n_total += n;
+        if n == 0 {
+            break;
+        }
+    }
 
-    if n == *len {
-        *len = n;
+    unsafe {*len = n_total};
+
+    if n_total == buffer.len() {
         Status::SUCCESS
     } else {
-        *len = n;
         Status::TIMEOUT
     }
 }
@@ -250,7 +273,7 @@ pub fn install() -> anyhow::Result<Handle> {
 
     let protocol_interface = CustomSerialIoProtocol {
         inner: SerialIoProtocol {
-            revision: SerialIoProtocol::REVISION,
+            revision: SerialIoProtocolRevision::REVISION_1_1,
             reset: serial_protocol_reset,
             set_attributes: serial_protocol_set_attributes,
             set_control_bits: serial_protocol_set_control_bits,
@@ -262,7 +285,7 @@ pub fn install() -> anyhow::Result<Handle> {
         mode: SerialIoMode {
             control_mask: Default::default(),
             timeout: 1000, /* µs */
-            baud_rate: 115200,
+            baud_rate: 9600,
             receive_fifo_depth: 16,
             data_bits: 8,
             parity: EfiParity::NONE,

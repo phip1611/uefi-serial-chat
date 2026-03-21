@@ -255,7 +255,7 @@ mod actions {
                         OpenProtocolAttributes::GetProtocol,
                     )?
                 };
-                proto.to_string(DisplayOnly(true), AllowShortcuts(true))?
+                proto.to_string16(DisplayOnly(true), AllowShortcuts(true))?
             };
             let msg = format!("[{i}]: {dvp}\n");
             backend.write_str(&msg)?;

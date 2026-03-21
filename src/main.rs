@@ -9,6 +9,7 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
+use uart_16550::{Config, Uart16550Tty};
 use {
     crate::chat::start_chat,
     alloc::{
